@@ -3,6 +3,9 @@ import SwiftUI
 /// The menu bar panel, laid out like the system Sound menu.
 struct MenuContentView: View {
     @EnvironmentObject private var model: MixerModel
+    @Environment(\.openVolumistSettings) private var openSettings
+    @AppStorage(Preferences.showOutputSection) private var showOutputSection = true
+    @AppStorage(Preferences.showInputSection) private var showInputSection = true
     /// Device lists start collapsed to the selected device every time the menu opens.
     @State private var outputExpanded: Bool
     @State private var inputExpanded: Bool
@@ -48,27 +51,30 @@ struct MenuContentView: View {
                 AppList(apps: model.apps)
             }
 
-            MenuSeparator()
-            DeviceSection(title: "Output", state: model.output, isExpanded: $outputExpanded)
+            if showOutputSection {
+                MenuSeparator()
+                DeviceSection(title: "Output", state: model.output, isExpanded: $outputExpanded)
+            }
 
-            MenuSeparator()
-            DeviceSection(title: "Input", state: model.input, isExpanded: $inputExpanded)
+            if showInputSection {
+                MenuSeparator()
+                DeviceSection(title: "Input", state: model.input, isExpanded: $inputExpanded)
+            }
 
             MenuSeparator()
             MenuActionRow(title: "Sound Settings…") { model.openSoundSettings() }
-            MenuActionRow(title: "Open at Login", isChecked: model.launchAtLogin) {
-                model.setLaunchAtLogin(!model.launchAtLogin)
-            }
+            MenuActionRow(title: "Volumist Settings…") { openSettings() }
             MenuActionRow(title: "Quit Volumist") { NSApp.terminate(nil) }
         }
         .padding(.bottom, 6)
         .frame(width: MenuMetrics.width)
         .onAppear(perform: menuOpened)
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
-            menuOpened()
+        // Only the menu's own window counts, not the Settings window.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            if !SettingsWindowController.isSettingsWindow(note.object) { menuOpened() }
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in
-            model.menuDidClose()
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { note in
+            if !SettingsWindowController.isSettingsWindow(note.object) { model.menuDidClose() }
         }
     }
 
@@ -91,6 +97,7 @@ enum MenuMetrics {
 
 private struct OutputVolumeRow: View {
     @EnvironmentObject private var model: MixerModel
+    @AppStorage(Preferences.mainVolumeStep) private var step = 0.0
 
     var body: some View {
         let state = model.output
@@ -100,7 +107,8 @@ private struct OutputVolumeRow: View {
                 .frame(width: 16)
             MenuSlider(
                 value: Binding(get: { state.muted ? 0 : state.volume }, set: { model.setVolume($0, .output) }),
-                isEnabled: state.volumeSettable
+                isEnabled: state.volumeSettable,
+                step: step
             )
             MuteButton(isMuted: state.muted, label: "Output") {
                 model.toggleMute(.output)
@@ -142,6 +150,7 @@ private struct AppList: View {
 private struct AppRow: View {
     @EnvironmentObject private var model: MixerModel
     let app: AppAudio
+    @AppStorage(Preferences.appVolumeStep) private var step = 0.0
     @State private var iconHovered = false
 
     var body: some View {
@@ -190,7 +199,8 @@ private struct AppRow: View {
                     MenuSlider(
                         value: Binding(get: { app.isMuted ? 0 : app.volume }, set: { model.setVolume($0, for: app.id) }),
                         isDimmed: app.isMuted,
-                        controlSize: .small
+                        controlSize: .small,
+                        step: step
                     )
                     MuteButton(isMuted: app.isMuted, size: 20, label: app.name) {
                         model.toggleMute(for: app.id)

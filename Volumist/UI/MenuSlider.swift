@@ -7,13 +7,20 @@ struct MenuSlider: View {
     var isEnabled = true
     var isDimmed = false
     var controlSize: ControlSize = .regular
+    /// Snap to multiples of this (e.g. 0.1 for 10%); 0 for continuous.
+    var step: Double = 0
 
     var body: some View {
-        Slider(value: $value, in: 0...1)
+        Slider(value: Binding(get: { value }, set: { value = snapped($0) }), in: 0...1)
             .labelsHidden()
             .controlSize(controlSize)
             .tint(isDimmed ? Color.secondary : Color.accentColor)
             .disabled(!isEnabled)
             .accessibilityLabel("Volume")
+    }
+
+    private func snapped(_ raw: Double) -> Double {
+        guard step > 0 else { return raw }
+        return min(max((raw / step).rounded() * step, 0), 1)
     }
 }

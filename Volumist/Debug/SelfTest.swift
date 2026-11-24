@@ -1,4 +1,5 @@
 #if DEBUG
+import AppKit
 import CoreAudio
 import Foundation
 import Synchronization
@@ -6,6 +7,15 @@ import Synchronization
 /// `Volumist --self-test <tone.wav> <report.txt>`: plays a tone with afplay, taps it into
 /// BlackHole (so nothing is audible), and measures the level that arrives at each gain.
 enum SelfTest {
+    /// Tests that need a fully launched app.
+    @MainActor static func runAfterLaunchIfRequested(model: MixerModel) {
+        let args = CommandLine.arguments
+        if let index = args.firstIndex(of: "--settings-snapshot"), args.count > index + 1 {
+            SettingsWindowController(model: model).snapshotTabs(to: URL(fileURLWithPath: args[index + 1]))
+            exit(0)
+        }
+    }
+
     static func runIfRequested() {
         let args = CommandLine.arguments
         if let index = args.firstIndex(of: "--model-test"), args.count > index + 1 {

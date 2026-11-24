@@ -23,6 +23,15 @@ struct AppAudio: Identifiable {
     var isMuted: Bool
 }
 
+/// An app for the Settings › Apps list: anything with an audio client, plus apps that are
+/// hidden or have saved volume settings even if they aren't running.
+struct KnownApp: Identifiable {
+    let id: String
+    let name: String
+    let icon: NSImage
+    let isRunning: Bool
+}
+
 struct DeviceState {
     let direction: AudioDirection
     var devices: [AudioDevice] = []
@@ -52,6 +61,10 @@ final class MixerModel: ObservableObject {
     /// Increments each time the menu opens (restarts one-shot animations like title scrolling).
     @Published private(set) var menuSession = 0
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published private(set) var knownApps: [KnownApp] = []
+    /// Bundle IDs of apps the user hid from the menu. Their volume settings still apply.
+    @Published private(set) var hiddenApps: Set<String> = []
+    private static let hiddenAppsKey = "hiddenApps"
 
     private static let settingsKey = "appSettings"
     private var settings: [String: AppSetting] = [:]
@@ -76,6 +89,7 @@ final class MixerModel: ObservableObject {
     private var outputVolumeListeners: [PropertyListener] = []
 
     init() {
+        hiddenApps = Set(UserDefaults.standard.stringArray(forKey: Self.hiddenAppsKey) ?? [])
         if let data = UserDefaults.standard.data(forKey: Self.settingsKey),
            let saved = try? JSONDecoder().decode([String: AppSetting].self, from: data) {
             settings = saved
@@ -227,7 +241,9 @@ final class MixerModel: ObservableObject {
         latest = grouped
         apps = grouped.values
             .filter { $0.isPlaying || seen.contains($0.id) || settings[$0.id] != nil }
+            .filter { !hiddenApps.contains($0.id) }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        refreshKnownApps()
 
         nowPlaying.track(running: Set(grouped.keys))
         syncTaps()
@@ -295,6 +311,28 @@ final class MixerModel: ObservableObject {
         levelMonitor = nil
         monitoredProcesses = [:]
         lastHeard = [:]
+    }
+
+    // MARK: - Hidden apps
+
+    func setHidden(_ hidden: Bool, appID: String) {
+        if hidden { hiddenApps.insert(appID) } else { hiddenApps.remove(appID) }
+        UserDefaults.standard.set(hiddenApps.sorted(), forKey: Self.hiddenAppsKey)
+        refreshApps()
+    }
+
+    private func refreshKnownApps() {
+        var known: [String: KnownApp] = [:]
+        for entry in latest.values {
+            known[entry.id] = KnownApp(id: entry.id, name: entry.name, icon: entry.icon, isRunning: true)
+        }
+        // Hidden or adjusted apps that aren't running: look them up on disk.
+        for id in hiddenApps.union(settings.keys) where known[id] == nil && !id.hasPrefix("pid:") {
+            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { continue }
+            let name = FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
+            known[id] = KnownApp(id: id, name: name, icon: NSWorkspace.shared.icon(forFile: url.path), isRunning: false)
+        }
+        knownApps = known.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     #if DEBUG
@@ -431,6 +469,10 @@ final class MixerModel: ObservableObject {
     }
 
     // MARK: - Misc
+
+    func refreshLaunchAtLogin() {
+        launchAtLogin = SMAppService.mainApp.status == .enabled
+    }
 
     func setLaunchAtLogin(_ enabled: Bool) {
         do {

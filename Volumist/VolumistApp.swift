@@ -8,6 +8,7 @@ struct VolumistApp: App {
         MenuBarExtra {
             MenuContentView()
                 .environmentObject(appDelegate.model)
+                .environment(\.openVolumistSettings, appDelegate.showSettings)
         } label: {
             Image(systemName: "slider.vertical.3")
                 .accessibilityLabel("Volumist")
@@ -19,6 +20,11 @@ struct VolumistApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model: MixerModel
+    private lazy var settingsWindow = SettingsWindowController(model: model)
+
+    func showSettings() {
+        settingsWindow.show()
+    }
 
     override init() {
         #if DEBUG
@@ -26,6 +32,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #endif
         model = MixerModel()
         super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        SelfTest.runAfterLaunchIfRequested(model: model)
+        #endif
     }
 
     func applicationWillTerminate(_ notification: Notification) {
