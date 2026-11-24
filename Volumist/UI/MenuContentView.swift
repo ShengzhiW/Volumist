@@ -320,18 +320,21 @@ struct VolumeLabel: View {
 }
 
 /// Single-line text that fills the width it's offered. When the text is longer, it fades
-/// out at the trailing edge, and while `scrolls` is on it scrolls through once per menu
-/// session (`session`) and then eases back to the start.
+/// out at the trailing edge, and while `scrolls` is on it loops through once per menu
+/// session (`session`) like a ticker: the text moves left, a copy follows after a gap,
+/// and the loop ends exactly where it started.
 struct MarqueeText: View {
     let text: String
     let scrolls: Bool
     let session: Int
 
     private let fadeWidth: CGFloat = 18
+    private let gap: CGFloat = 36
     private let pointsPerSecond: CGFloat = 30
     @State private var textWidth: CGFloat = 0
     @State private var availableWidth: CGFloat = 0
     @State private var offset: CGFloat = 0
+    @State private var isScrolling = false
 
     init(_ text: String, scrolls: Bool, session: Int) {
         self.text = text
@@ -346,41 +349,53 @@ struct MarqueeText: View {
     }
 
     var body: some View {
-        let overflow = max(textWidth - availableWidth, 0)
-        let overflows = overflow > 0.5
-        Text(text)
-            .lineLimit(1)
-            .fixedSize()
-            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { textWidth = $0 }
-            .offset(x: offset)
-            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { availableWidth = $0 }
-            .clipped()
-            .mask {
-                HStack(spacing: 0) {
-                    LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
-                        .frame(width: offset < 0 ? fadeWidth : 0)
-                    Rectangle()
-                    LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
-                        .frame(width: overflows ? fadeWidth : 0)
-                }
+        let overflows = textWidth > availableWidth + 0.5
+        HStack(spacing: gap) {
+            Text(text)
+                .lineLimit(1)
+                .fixedSize()
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { textWidth = $0 }
+            if isScrolling {
+                // The copy that slides in behind the original to close the loop.
+                Text(text)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .accessibilityHidden(true)
             }
-            .task(id: Run(text: text, session: session, canScroll: scrolls && overflows)) {
-                offset = 0
-                guard scrolls, overflows else { return }
-                // Travel far enough that the last character clears the trailing fade.
-                let distance = overflow + fadeWidth
-                let duration = Double(distance / pointsPerSecond)
-                do {
-                    try await Task.sleep(for: .seconds(1.2))
-                    withAnimation(.linear(duration: duration)) { offset = -distance }
-                    try await Task.sleep(for: .seconds(duration + 1.5))
-                    withAnimation(.easeInOut(duration: 0.4)) { offset = 0 }
-                } catch {
-                    offset = 0
-                }
+        }
+        .fixedSize()
+        .offset(x: offset)
+        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { availableWidth = $0 }
+        .clipped()
+        .mask {
+            HStack(spacing: 0) {
+                LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
+                    .frame(width: isScrolling ? fadeWidth : 0)
+                Rectangle()
+                LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                    .frame(width: overflows ? fadeWidth : 0)
             }
-            .accessibilityLabel(text)
+        }
+        .task(id: Run(text: text, session: session, canScroll: scrolls && overflows)) {
+            offset = 0
+            isScrolling = false
+            guard scrolls, overflows else { return }
+            let distance = textWidth + gap
+            let duration = Double(distance / pointsPerSecond)
+            do {
+                try await Task.sleep(for: .seconds(1.2))
+                withAnimation(.easeIn(duration: 0.3)) { isScrolling = true }
+                withAnimation(.linear(duration: duration)) { offset = -distance }
+                try await Task.sleep(for: .seconds(duration))
+            } catch {}
+            // The copy now sits where the original started, so this jump is invisible.
+            var reset = Transaction()
+            reset.disablesAnimations = true
+            withTransaction(reset) { offset = 0 }
+            withAnimation(.easeOut(duration: 0.3)) { isScrolling = false }
+        }
+        .accessibilityLabel(text)
     }
 }
 
