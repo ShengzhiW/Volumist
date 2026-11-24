@@ -3,7 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 OUT=build
-rm -rf $OUT && mkdir -p $OUT
+mkdir -p $OUT
+# Remove only what this script rebuilds, so the installer packages survive.
+rm -rf $OUT/VolumistSpike.driver $OUT/spike-host $OUT/spike-tone
 
 DRIVER=$OUT/VolumistSpike.driver
 mkdir -p $DRIVER/Contents/MacOS
