@@ -81,7 +81,20 @@ One region created by the app (for example `/volumist.v1`), attached by the driv
 4. Which route out is better: the app playing the mix (this plan) or the driver playing it itself (what AppVolume appears to do)? Measure latency and stability.
 5. Confirm there is no purple dot and no permission prompt.
 
-*Spike status (2026-11-24):* the driver, host and tone programs are written and build cleanly (`spike/`, see its README). The host and tone programs were tested without the driver. **The driver hasn't been installed**, because installing needs an admin password, so none of the five questions are answered yet. To continue: install it with the command in `spike/README.md`, then run the silent BlackHole test.
+*Spike results (2026-11-24),* installed with `spike/make-installer.sh`'s package, silent test (tone into the spike device, host output to BlackHole):
+
+1. **Ad-hoc signing: yes.** A locally signed driver loads on macOS 27; "Volumist Spike" appears as a device. No Developer ID needed for development.
+2. **Client PIDs: yes.** `AddDeviceClient` reports each process's PID and bundle ID (a command-line tool has no bundle ID). **Every process with an audio client registers with every device**: about 50 here, including `com.apple.WebKit.GPU` helpers. The real driver's client table must be larger than 64 slots.
+3. **Shared memory: yes.** The driver, running as `_coreaudiod` in the driver-service helper, attached to the host's `shm_open` region (mode 0666).
+4. **Per-app gain: works, exact.** Tone at 0.5: the mix peaked at 0.1250 with gain 0.25 and 0.5000 with gain 1.0, measured both in the driver and in what the host played out. The mix arrived at about 48,128 frames/s.
+5. **No indicators: confirmed.** During 20-second runs there was no purple recording dot. The first run did show an orange microphone indicator ("Claude used microphone"). Cause: the host's IOProc was on BlackHole, which also has an input stream, and the HAL starts a device's inputs unless told otherwise. After setting `kAudioDevicePropertyIOProcStreamUsage` to turn the input streams off, Core Audio reported no process running input and no dot appeared.
+
+Findings that change the plan:
+- **Apply gains before the app's first buffer.** The host only learned the tone's PID from its once-a-second poll, so the first ~1.5 s played at full volume. The real app should publish gains keyed by bundle ID (plus responsible app) ahead of time, so the driver can resolve a new client's gain inside `AddDeviceClient`.
+- **Clock drift is still unmeasured.** BlackHole runs at 44.1 kHz, so the host fell behind about 4,000 frames/s and resynced. That's a rate mismatch, not drift. Drift and latency need a 48 kHz real output (or rate conversion in the host).
+- **Never start input you don't use.** When the app's output device also has an input (BlackHole, USB headsets, audio interfaces), turn its input streams off with `kAudioDevicePropertyIOProcStreamUsage`, or macOS shows the microphone indicator. The current tap-based Volumist has the same exposure: its aggregate devices include the output device's input streams.
+- **The driver's `os_log` messages don't appear in `log show`.** Diagnostics should go through shared-memory counters, as this spike's do.
+- Not yet tried: playing a real app (Safari) through the spike device, and the route where the driver plays to hardware itself.
 
 **1. Driver MVP.** Virtual device, client table, per-client gain, mix into the ring buffer, heartbeat, remove the device on disconnect.
 

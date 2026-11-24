@@ -102,6 +102,22 @@ static void Describe(AudioObjectID device) {
            rate == VSPIKE_SAMPLE_RATE ? "" : "  ** rate differs from the spike device: pitch will be off **");
 }
 
+/// A device with input streams (BlackHole, USB headsets) would otherwise start its input too,
+/// which macOS counts as microphone use. Tell the HAL this IOProc only uses the outputs.
+static void DisableInputStreams(AudioObjectID device, AudioDeviceIOProcID proc) {
+    AudioObjectPropertyAddress a = {kAudioDevicePropertyIOProcStreamUsage, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain};
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(device, &a, 0, NULL, &size) != noErr || size == 0) return;
+    AudioHardwareIOProcStreamUsage *usage = calloc(1, size);
+    usage->mIOProc = (void *)proc;
+    if (AudioObjectGetPropertyData(device, &a, 0, NULL, &size, usage) == noErr) {
+        for (UInt32 i = 0; i < usage->mNumberStreams; i++) usage->mStreamIsOn[i] = 0;
+        OSStatus status = AudioObjectSetPropertyData(device, &a, 0, NULL, size, usage);
+        printf("input streams turned off: %u (status %d)\n", usage->mNumberStreams, (int)status);
+    }
+    free(usage);
+}
+
 static void SetGain(int32_t pid, float gain) {
     for (int i = 0; i < VSPIKE_MAX_CLIENTS; i++) {
         if (atomic_load(&gShared->gains[i].pid) == pid) { atomic_store(&gShared->gains[i].gainBits, F2Bits(gain)); return; }
@@ -160,6 +176,7 @@ int main(int argc, char **argv) {
 
     AudioDeviceIOProcID proc = NULL;
     OSStatus status = AudioDeviceCreateIOProcID(device, PlayMix, NULL, &proc);
+    if (status == noErr) DisableInputStreams(device, proc);
     if (status == noErr) status = AudioDeviceStart(device, proc);
     if (status != noErr) { fprintf(stderr, "could not start output: %d\n", (int)status); return 1; }
 

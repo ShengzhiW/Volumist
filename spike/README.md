@@ -12,7 +12,9 @@ Phase 0 of [the driver plan](../docs/driver-architecture.md): a throwaway pass-t
 ./build.sh
 ```
 
-Installing needs an admin password and restarts Core Audio, so all sound cuts out briefly:
+The easiest way to install is the double-click installers. Build them with `./make-installer.sh`, then open `build/Install Volumist Spike.pkg`; `build/Uninstall Volumist Spike.pkg` removes the driver. Both ask for an admin password and restart Core Audio, so all sound cuts out briefly.
+
+Or from Terminal:
 
 ```bash
 sudo cp -R build/VolumistSpike.driver /Library/Audio/Plug-Ins/HAL/ && sudo killall coreaudiod
