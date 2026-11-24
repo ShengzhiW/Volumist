@@ -68,6 +68,9 @@ struct MenuContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
             menuOpened()
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in
+            model.menuDidClose()
+        }
     }
 
     private func menuOpened() {
@@ -156,7 +159,7 @@ private struct AppRow: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .layoutPriority(1)
-                    if app.isPlaying {
+                    if app.isAudible {
                         Image(systemName: "waveform")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(.secondary)

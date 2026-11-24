@@ -11,7 +11,10 @@ struct AppAudio: Identifiable {
     var name: String
     var icon: NSImage
     var processObjectIDs: [AudioObjectID]
+    /// The app has an output stream running (it may be paused and playing silence).
     var isPlaying: Bool
+    /// The app is actually making sound. Measured while the menu is open.
+    var isAudible = false
     var nowPlaying: String?
     var volume: Double
     var isMuted: Bool
@@ -55,6 +58,14 @@ final class MixerModel: ObservableObject {
     private var refreshPending = false
     private let nowPlaying = NowPlayingMonitor()
 
+    private var menuIsOpen = false
+    private var levelMonitor: LevelMonitor?
+    private var monitoredProcesses: [String: [AudioObjectID]] = [:]
+    private var levelTimer: Timer?
+    private var lastHeard: [String: Date] = [:]
+    private static let audibleThreshold: Float = 0.0003  // about -70 dB
+    private static let audibleHold: TimeInterval = 1.0
+
     private var systemListeners: [PropertyListener] = []
     private var processListeners: [AudioObjectID: PropertyListener] = [:]
     private var outputVolumeListeners: [PropertyListener] = []
@@ -89,6 +100,7 @@ final class MixerModel: ObservableObject {
     }
 
     func shutdown() {
+        stopLevelMonitoring()
         taps.values.forEach { $0.invalidate() }
         taps.removeAll()
     }
@@ -101,7 +113,22 @@ final class MixerModel: ObservableObject {
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
         refreshVolume(.output)
+        menuIsOpen = true
+        // The status check can't always tell "granted" from "never asked"; asking settles it
+        // (instantly and silently when already granted).
+        if permission == .unknown { requestPermission() }
         refreshApps()
+        if levelTimer == nil {
+            levelTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.readLevels() }
+            }
+        }
+    }
+
+    /// Called when the menu closes; level metering only runs while it's visible.
+    func menuDidClose() {
+        menuIsOpen = false
+        stopLevelMonitoring()
     }
 
     // MARK: - Apps
@@ -184,6 +211,70 @@ final class MixerModel: ObservableObject {
 
         nowPlaying.track(running: Set(grouped.keys))
         syncTaps()
+        updateLevelMonitor()
+    }
+
+    // MARK: - Levels
+
+    /// Meters every listed app whose output stream is running, while the menu is open.
+    private func updateLevelMonitor() {
+        guard menuIsOpen, permission == .authorized else {
+            levelMonitor?.invalidate()
+            levelMonitor = nil
+            monitoredProcesses = [:]
+            applyAudible()
+            return
+        }
+        let wanted = Dictionary(uniqueKeysWithValues: apps.filter(\.isPlaying).map { ($0.id, $0.processObjectIDs.sorted()) })
+        if wanted != monitoredProcesses {
+            levelMonitor?.invalidate()
+            levelMonitor = nil
+            monitoredProcesses = [:]
+            if !wanted.isEmpty {
+                do {
+                    levelMonitor = try LevelMonitor(groups: wanted.map { (key: $0.key, processes: $0.value) })
+                    monitoredProcesses = wanted
+                } catch {
+                    log.error("Level monitor: \(String(describing: error), privacy: .public)")
+                }
+            }
+        }
+        applyAudible()
+    }
+
+    private func readLevels() {
+        guard let levelMonitor else { return }
+        let now = Date()
+        for (key, peak) in levelMonitor.takePeaks() where peak > Self.audibleThreshold {
+            lastHeard[key] = now
+        }
+        applyAudible()
+    }
+
+    private func applyAudible() {
+        let now = Date()
+        for index in apps.indices {
+            let app = apps[index]
+            let audible: Bool
+            if levelMonitor == nil {
+                // Can't measure (menu closed or no permission): trust the stream state.
+                audible = app.isPlaying
+            } else if monitoredProcesses[app.id] != nil {
+                audible = lastHeard[app.id].map { now.timeIntervalSince($0) < Self.audibleHold } ?? false
+            } else {
+                audible = false
+            }
+            if app.isAudible != audible { apps[index].isAudible = audible }
+        }
+    }
+
+    private func stopLevelMonitoring() {
+        levelTimer?.invalidate()
+        levelTimer = nil
+        levelMonitor?.invalidate()
+        levelMonitor = nil
+        monitoredProcesses = [:]
+        lastHeard = [:]
     }
 
     #if DEBUG
@@ -240,18 +331,23 @@ final class MixerModel: ObservableObject {
         case .denied:
             return false
         case .unknown:
-            guard !requestingPermission else { return false }
-            requestingPermission = true
-            AudioCapturePermission.request { [weak self] result in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    self.requestingPermission = false
-                    // If TCC can't be queried at all, let Core Audio handle it.
-                    self.permission = result == .unknown ? .authorized : result
-                    self.syncTaps()
-                }
-            }
+            requestPermission()
             return false
+        }
+    }
+
+    private func requestPermission() {
+        guard !requestingPermission else { return }
+        requestingPermission = true
+        AudioCapturePermission.request { [weak self] result in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.requestingPermission = false
+                // If TCC can't be queried at all, let Core Audio handle it.
+                self.permission = result == .unknown ? .authorized : result
+                self.syncTaps()
+                self.updateLevelMonitor()
+            }
         }
     }
 

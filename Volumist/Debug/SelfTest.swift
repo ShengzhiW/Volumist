@@ -8,6 +8,12 @@ import Synchronization
 enum SelfTest {
     static func runIfRequested() {
         let args = CommandLine.arguments
+        if let index = args.firstIndex(of: "--model-test"), args.count > index + 1 {
+            MainActor.assumeIsolated { runModelTest(report: URL(fileURLWithPath: args[index + 1])) }
+        }
+        if let index = args.firstIndex(of: "--level-test"), args.count > index + 1 {
+            runLevelTest(report: URL(fileURLWithPath: args[index + 1]))
+        }
         guard let index = args.firstIndex(of: "--self-test"), args.count > index + 2 else { return }
         let tone = args[index + 1]
         let reportURL = URL(fileURLWithPath: args[index + 2])
@@ -60,6 +66,45 @@ enum SelfTest {
         note("done")
         exit(0)
     }
+}
+
+/// `Volumist --model-test <report.txt>`: opens the menu's model state for 2 s and reports,
+/// per listed app, whether its stream is running and whether it's judged audible.
+@MainActor private func runModelTest(report: URL) {
+    let model = MixerModel()
+    model.menuWillOpen()
+    RunLoop.main.run(until: Date().addingTimeInterval(2))
+    var lines = ["permission: \(model.permission)"]
+    for app in model.apps {
+        lines.append("\(app.name): streamRunning=\(app.isPlaying) audible=\(app.isAudible)")
+    }
+    model.menuDidClose()
+    model.shutdown()
+    try? lines.joined(separator: "\n").write(to: report, atomically: true, encoding: .utf8)
+    exit(0)
+}
+
+/// `Volumist --level-test <report.txt>`: meters every app with a running output stream
+/// for 1.5 s and reports each one's peak, to tell real playback from a paused stream.
+private func runLevelTest(report: URL) {
+    var groups: [String: [AudioObjectID]] = [:]
+    for process in AudioProcesses.all() where process.isRunningOutput {
+        guard let app = AudioProcesses.owningApplication(for: process) else { continue }
+        groups[app.localizedName ?? "pid \(app.processIdentifier)", default: []].append(process.objectID)
+    }
+    var lines = ["permission: \(AudioCapturePermission.current)"]
+    do {
+        let monitor = try LevelMonitor(groups: groups.map { (key: $0.key, processes: $0.value) })
+        Thread.sleep(forTimeInterval: 1.5)
+        for (name, peak) in monitor.takePeaks().sorted(by: { $0.key < $1.key }) {
+            lines.append(String(format: "%@: peak %.5f", name, peak))
+        }
+        monitor.invalidate()
+    } catch {
+        lines.append("FAIL: \(error)")
+    }
+    try? lines.joined(separator: "\n").write(to: report, atomically: true, encoding: .utf8)
+    exit(0)
 }
 
 /// A non-muting tap on Volumist's own output: whatever our AppTap plays shows up here.
