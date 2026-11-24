@@ -1,0 +1,106 @@
+# Plan: per-app volume through a Volumist audio driver
+
+Status: proposal, nothing built yet. Branch: `driver-architecture`.
+
+## Why
+
+Volumist currently changes an app's volume with Core Audio **process taps**: it captures the app's audio, mutes the original, and plays the capture back at the chosen volume. macOS treats any tap as recording, so it:
+
+- needs the **System Audio Recording** permission, and
+- shows the **purple recording dot** in the menu bar whenever a tap runs.
+
+Neither can be turned off. The only way around them is to never capture: put a **virtual output device** (a Core Audio driver, `AudioServerPlugIn`) between apps and the speakers, and change each app's volume inside the driver as its audio passes through.
+
+## Evidence: how AppVolume does it
+
+AppVolume is installed on this Mac. Its installer put a driver at `/Library/Audio/Plug-Ins/HAL/AppVolumeAudioDevice.driver`. Inspecting the bundle (not running it) shows:
+
+| Observed | What it tells us |
+|---|---|
+| Registered as an `AudioServerPlugIn` factory; Developer ID signed; no entitlements | A standard HAL driver loaded by `coreaudiod`; no special Apple approval needed |
+| Written in Rust; links CoreAudio, AudioToolbox, Security | Any language works if it exports the C plug-in interface |
+| Log strings: `Client ADDED pid=`, `Settings updated for PID`, `ProcessOutput`, `MixOutput` | The driver identifies each app by process ID and applies its gain per client before mixing |
+| Imports `socket`/`connect`, `shm_open`/`mmap`; strings `RING_BUFFER attached shm_name=`, `creator_pid` validation | Control over a socket to its background process; audio through a shared-memory ring buffer the app creates and the driver validates |
+| `removing virtual device` when its process isn't connected; the device isn't in the device list now | **The virtual device only exists while the app runs**, so macOS falls back to real speakers if the app quits or crashes |
+| `Output device changed to`, `AudioOutput: render_callbacks`, `circular routing guard` | Suggests the driver plays the final mix to the real device itself, guarding against routing into its own device. **Not confirmed.** |
+
+## Architecture
+
+```
+ apps ──► [Volumist Device]  (virtual default output, inside coreaudiod)
+              │  per app:  ProcessOutput → gain[pid] → meter[pid]
+              │  mixed:    WriteMix → ring buffer (shared memory)
+              ▼
+         Volumist.app ── reads ring buffer ──► real output device (IOProc)
+              ▲
+              └── control block (shared memory): gains, mutes, client list, levels
+```
+
+### 1. The driver (`VolumistDriver.driver`)
+
+- One stereo, 32-bit float output device named "Volumist". Nominal rate follows the real output (44.1–192 kHz).
+- `AddDeviceClient` / `RemoveDeviceClient` receive each client's **PID and bundle ID**; keep a fixed table of client slots, so nothing is allocated on the IO thread.
+- `DoIOOperation`:
+  - `ProcessOutput` (once per client, before mixing): multiply by that client's gain, ramped across the buffer like today's `TapRenderer`; record its peak level.
+  - `WriteMix` (the mix): copy into the shared ring buffer for the app.
+- Volume and mute controls on the device, so the volume keys and the system Sound menu work. The app mirrors them to the real device.
+- **Exists only while Volumist is connected.** On disconnect, remove the device, so macOS switches back to the real output.
+- Language: C++ on Apple's *Creating an Audio Server Driver Plug-in* sample (NullAudio), or the MIT-licensed libASPL wrapper. Swift is a poor fit for this real-time, C-ABI code.
+
+### 2. Shared memory between the app and the driver
+
+One region created by the app (for example `/volumist.v1`), attached by the driver:
+
+- **Control block:** per-client gain and mute (atomics written by the app), and the driver's client table (PID, bundle ID, live flag) plus per-client peak levels.
+- **Audio ring buffer:** the mix, single producer (driver) and single consumer (app), with read and write positions.
+- **Handshake:** a version number, the app's PID and a heartbeat. The driver validates them, as AppVolume checks `creator_pid`. If the heartbeat stops, the driver removes its device.
+- The driver runs as `_coreaudiod`, so the region's permissions must let it attach. Find out whether the driver's sandbox allows `shm_open` on our name (AppVolume shows it's possible).
+
+### 3. The app
+
+- **Output engine:** reads the ring buffer and plays it to the real device in an IOProc. Handles clock drift between the virtual device and the hardware with a small adaptive buffer or resampling.
+- **Routing:** on launch, remember the real output, make "Volumist" the default, and route to the real one. Choosing an output in our menu changes where the engine plays, not the system default. On quit, restore the real device first.
+- **Per-app volume:** replace `AppTap` with writes to the control block. Above 100% becomes possible (AppVolume offers 200%), with a limiter.
+- **Playing detection:** read the driver's per-client peaks instead of `LevelMonitor` taps. No dot, and it works while the menu is closed.
+- **App list:** keep the current process-based list, plus the driver's client table, which already gives the PID of the process actually playing.
+- **Device list:** hide the "Volumist" device from our Output section.
+- Now-playing titles, Settings, hiding apps and devices: unchanged.
+
+### 4. Installing and removing
+
+- Installing a HAL driver needs an admin password: copy it to `/Library/Audio/Plug-Ins/HAL`, then restart `coreaudiod`, which cuts all audio for about a second.
+- Ship a signed installer package (`pkgbuild`/`productbuild` plus a postinstall script). Show driver status and an Install button in Settings, plus a matching uninstaller.
+- Distribution needs Developer ID signing and notarization for both the app and the driver. Whether an ad-hoc-signed driver loads on macOS 27 for local development is an open question for the spike.
+
+## Phases
+
+**0. Spike (de-risk before committing to this).** Build the NullAudio sample as a pass-through device and answer:
+1. Does an ad-hoc-signed driver load on macOS 27, or is a Developer ID needed even locally?
+2. Do `AddDeviceClient` PIDs match the PIDs Volumist sees, including helper processes like `com.apple.WebKit.GPU`?
+3. Can the driver attach to shared memory created by the app?
+4. Which route out is better: the app playing the mix (this plan) or the driver playing it itself (what AppVolume appears to do)? Measure latency and stability.
+5. Confirm there is no purple dot and no permission prompt.
+
+*Spike status (2026-11-24):* the driver, host and tone programs are written and build cleanly (`spike/`, see its README). The host and tone programs were tested without the driver. **The driver hasn't been installed**, because installing needs an admin password, so none of the five questions are answered yet. To continue: install it with the command in `spike/README.md`, then run the silent BlackHole test.
+
+**1. Driver MVP.** Virtual device, client table, per-client gain, mix into the ring buffer, heartbeat, remove the device on disconnect.
+
+**2. App output engine.** Ring buffer to real device, drift handling, default-device takeover and restore, volume and mute mirroring.
+
+**3. Port features.** Per-app volume and mute through the control block; levels from the driver; drop the audio-capture permission UI on this path.
+
+**4. Installer.** Package, Settings status and install/uninstall, restarting `coreaudiod`.
+
+**5. Hardening.** Sample-rate and device changes, Bluetooth and AirPlay, sleep and wake, crash recovery, apps that pick a specific device.
+
+**6. Decide on taps.** Keep the tap engine as a fallback ("Use audio driver" on or off) until the driver path is proven, then remove it or keep it for users who won't install a driver.
+
+## Risks and open questions
+
+- **Crash safety:** if Volumist dies while "Volumist" is the default output, everything goes silent until the device disappears. The heartbeat plus removing the device must make this recover within about a second. This is the main thing to test.
+- **Apps that choose their own device** (DAWs, Zoom, Teams, games) bypass the virtual device, and their volume can't be controlled. Taps could still cover them.
+- **Latency:** an extra buffer hop adds a few milliseconds; check A/V sync in video.
+- **Fragility:** a driver bug affects all audio, and the driver must be retested on each macOS release.
+- **Other virtual-device apps** (SoundSource's ACE, Teams, Zoom, BlackHole, AppVolume's leftover driver) must coexist with ours.
+- **Security:** anything that can open the shared memory could change gains or read the mix. Restrict permissions and validate the creator PID.
+- **Rate and channel changes** mid-stream: driver and app must agree on the format before resuming IO.
