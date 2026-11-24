@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Volumist asks music players for the current track title to show next to their volume.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Volumist captures each app's audio so it can change that app's volume.</string>
 </dict>

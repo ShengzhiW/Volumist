@@ -18,8 +18,14 @@ struct MenuContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Sound")
-                .font(.system(size: 13, weight: .bold))
+            HStack {
+                Text("Sound")
+                    .font(.system(size: 13, weight: .bold))
+                Spacer()
+                if model.output.volumeSettable {
+                    VolumeLabel(volume: model.output.volume, isMuted: model.output.muted)
+                }
+            }
                 .padding(.horizontal, MenuMetrics.inset)
                 .padding(.top, 11)
                 .padding(.bottom, 9)
@@ -149,16 +155,25 @@ private struct AppRow: View {
                         .font(.system(size: 13))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                        .layoutPriority(1)
                     if app.isPlaying {
                         Image(systemName: "waveform")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(.secondary)
                             .symbolEffect(.variableColor.iterative, options: .repeating)
                     }
-                    Spacer(minLength: 4)
-                    Text(app.isMuted ? "Muted" : "\(Int((app.volume * 100).rounded()))%")
-                        .font(.system(size: 11).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    if let title = app.nowPlaying {
+                        // Fills the space up to the percentage, fading out if it's longer.
+                        FadingText(title)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .padding(.leading, 2)
+                            .padding(.trailing, 6)
+                            .help(title)
+                    } else {
+                        Spacer(minLength: 6)
+                    }
+                    VolumeLabel(volume: app.volume, isMuted: app.isMuted)
                 }
                 HStack(spacing: 8) {
                     MenuSlider(
@@ -278,6 +293,49 @@ private struct DisclosureHeader: View {
 }
 
 // MARK: - Building blocks
+
+/// "45%", or "Muted".
+struct VolumeLabel: View {
+    let volume: Double
+    let isMuted: Bool
+
+    var body: some View {
+        Text(isMuted ? "Muted" : "\(Int((volume * 100).rounded()))%")
+            .font(.system(size: 11).monospacedDigit())
+            .foregroundStyle(.secondary)
+            .fixedSize()
+    }
+}
+
+/// Single-line text that fills the width it's offered and, when the text is longer,
+/// fades out at the trailing edge instead of truncating with an ellipsis.
+struct FadingText: View {
+    let text: String
+    private let fadeWidth: CGFloat = 18
+    @State private var textWidth: CGFloat = 0
+    @State private var availableWidth: CGFloat = 0
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        let overflows = textWidth > availableWidth + 0.5
+        Text(text)
+            .lineLimit(1)
+            .fixedSize()
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { textWidth = $0 }
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { availableWidth = $0 }
+            .clipped()
+            .mask {
+                HStack(spacing: 0) {
+                    Rectangle()
+                    LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: overflows ? fadeWidth : 0)
+                }
+            }
+            .accessibilityLabel(text)
+    }
+}
 
 /// Round mute toggle shown to the right of a volume slider.
 struct MuteButton: View {

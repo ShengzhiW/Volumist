@@ -12,6 +12,7 @@ struct AppAudio: Identifiable {
     var icon: NSImage
     var processObjectIDs: [AudioObjectID]
     var isPlaying: Bool
+    var nowPlaying: String?
     var volume: Double
     var isMuted: Bool
 }
@@ -52,6 +53,7 @@ final class MixerModel: ObservableObject {
     private var taps: [String: AppTap] = [:]
     private var requestingPermission = false
     private var refreshPending = false
+    private let nowPlaying = NowPlayingMonitor()
 
     private var systemListeners: [PropertyListener] = []
     private var processListeners: [AudioObjectID: PropertyListener] = [:]
@@ -63,6 +65,7 @@ final class MixerModel: ObservableObject {
             settings = saved
         }
         permission = AudioCapturePermission.current
+        nowPlaying.onChange = { [weak self] in self?.applyNowPlaying() }
 
         systemListeners = [
             PropertyListener(.system, AudioProcesses.listAddress) { [weak self] in
@@ -166,6 +169,7 @@ final class MixerModel: ObservableObject {
                     icon: app.icon ?? NSWorkspace.shared.icon(for: .application),
                     processObjectIDs: [process.objectID],
                     isPlaying: process.isRunningOutput,
+                    nowPlaying: nowPlaying.titles[key],
                     volume: setting.volume,
                     isMuted: setting.muted
                 )
@@ -178,7 +182,19 @@ final class MixerModel: ObservableObject {
             .filter { $0.isPlaying || seen.contains($0.id) || settings[$0.id] != nil }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
+        nowPlaying.track(running: Set(grouped.keys))
         syncTaps()
+    }
+
+    #if DEBUG
+    /// For previews and offscreen renders.
+    func overrideAppsForPreview(_ apps: [AppAudio]) { self.apps = apps }
+    #endif
+
+    private func applyNowPlaying() {
+        for index in apps.indices {
+            apps[index].nowPlaying = nowPlaying.titles[apps[index].id]
+        }
     }
 
     // MARK: - Taps
