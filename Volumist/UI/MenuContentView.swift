@@ -172,8 +172,7 @@ private struct AppRow: View {
                     MenuSlider(
                         value: Binding(get: { app.isMuted ? 0 : app.volume }, set: { model.setVolume($0, for: app.id) }),
                         isDimmed: app.isMuted,
-                        trackHeight: 5,
-                        knobSize: CGSize(width: 20, height: 13)
+                        controlSize: .small
                     )
                     MuteButton(isMuted: app.isMuted, size: 20, label: app.name) {
                         model.toggleMute(for: app.id)
