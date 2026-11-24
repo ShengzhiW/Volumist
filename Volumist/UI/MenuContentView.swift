@@ -90,21 +90,21 @@ private struct DeviceVolumeRow: View {
     var body: some View {
         let isOutput = state.direction == .output
         HStack(spacing: 8) {
-            Image(systemName: isOutput
-                  ? (state.muted ? "speaker.slash.fill" : "speaker.fill")
-                  : (state.muted ? "mic.slash.fill" : "mic.fill"))
+            Image(systemName: isOutput ? "speaker.fill" : "mic.fill")
                 .font(.system(size: isOutput ? 13 : 11))
                 .frame(width: 16)
-                .contentShape(Rectangle())
-                .onTapGesture { model.toggleMute(state.direction) }
-                .help(state.muted ? "Unmute" : "Mute")
             MenuSlider(
                 value: Binding(get: { state.muted ? 0 : state.volume }, set: { model.setVolume($0, state.direction) }),
                 isEnabled: state.volumeSettable
             )
-            Image(systemName: isOutput ? "speaker.wave.3.fill" : "mic.fill")
-                .font(.system(size: isOutput ? 13 : 15))
-                .frame(width: 22)
+            MuteButton(
+                isMuted: state.muted,
+                symbol: isOutput ? "speaker.wave.2.fill" : "mic.fill",
+                mutedSymbol: isOutput ? "speaker.slash.fill" : "mic.slash.fill",
+                label: isOutput ? "Output" : "Input"
+            ) {
+                model.toggleMute(state.direction)
+            }
         }
         .foregroundStyle(.primary.opacity(0.85))
         .padding(.horizontal, MenuMetrics.inset)
@@ -142,30 +142,14 @@ private struct AppList: View {
 private struct AppRow: View {
     @EnvironmentObject private var model: MixerModel
     let app: AppAudio
-    @State private var iconHovered = false
 
     var body: some View {
         HStack(spacing: 10) {
-            Button { model.toggleMute(for: app.id) } label: {
-                Image(nsImage: app.icon)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 28, height: 28)
-                    .opacity(app.isMuted ? 0.45 : 1)
-                    .overlay(alignment: .bottomTrailing) {
-                        if app.isMuted || iconHovered {
-                            Image(systemName: app.isMuted ? "speaker.slash.fill" : "speaker.fill")
-                                .font(.system(size: 7.5, weight: .bold))
-                                .foregroundStyle(.white)
-                                .frame(width: 14, height: 14)
-                                .background(Circle().fill(app.isMuted ? Color.red : Color.black.opacity(0.55)))
-                                .offset(x: 3, y: 3)
-                        }
-                    }
-            }
-            .buttonStyle(.plain)
-            .onHover { iconHovered = $0 }
-            .help(app.isMuted ? "Unmute \(app.name)" : "Mute \(app.name)")
+            Image(nsImage: app.icon)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 28, height: 28)
+                .opacity(app.isMuted ? 0.45 : 1)
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
@@ -184,12 +168,17 @@ private struct AppRow: View {
                         .font(.system(size: 11).monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
-                MenuSlider(
-                    value: Binding(get: { app.isMuted ? 0 : app.volume }, set: { model.setVolume($0, for: app.id) }),
-                    isDimmed: app.isMuted,
-                    trackHeight: 5,
-                    knobSize: CGSize(width: 20, height: 13)
-                )
+                HStack(spacing: 8) {
+                    MenuSlider(
+                        value: Binding(get: { app.isMuted ? 0 : app.volume }, set: { model.setVolume($0, for: app.id) }),
+                        isDimmed: app.isMuted,
+                        trackHeight: 5,
+                        knobSize: CGSize(width: 20, height: 13)
+                    )
+                    MuteButton(isMuted: app.isMuted, size: 20, label: app.name) {
+                        model.toggleMute(for: app.id)
+                    }
+                }
             }
         }
         .padding(.horizontal, MenuMetrics.inset)
@@ -298,6 +287,36 @@ private struct DisclosureHeader: View {
 }
 
 // MARK: - Building blocks
+
+/// Round mute toggle shown to the right of a volume slider.
+struct MuteButton: View {
+    let isMuted: Bool
+    var symbol = "speaker.wave.2.fill"
+    var mutedSymbol = "speaker.slash.fill"
+    var size: CGFloat = 22
+    let label: String
+    let action: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle()
+                    .fill(isMuted ? Color.red.opacity(0.16) : Color.primary.opacity(hovered ? 0.15 : 0.08))
+                Image(systemName: isMuted ? mutedSymbol : symbol)
+                    .font(.system(size: size * 0.45, weight: .semibold))
+                    .foregroundStyle(isMuted ? Color.red : Color.primary.opacity(0.75))
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .frame(width: size, height: size)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .help(isMuted ? "Unmute \(label)" : "Mute \(label)")
+        .accessibilityLabel(isMuted ? "Unmute \(label)" : "Mute \(label)")
+    }
+}
 
 struct CircleIcon: View {
     let symbol: String
