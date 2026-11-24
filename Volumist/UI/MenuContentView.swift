@@ -36,10 +36,9 @@ struct MenuContentView: View {
             SectionHeader("Applications")
 
             if model.permission == .denied {
+                // Per-app volume needs the permission; show only how to grant it.
                 PermissionRow()
-            }
-
-            if model.apps.isEmpty {
+            } else if model.apps.isEmpty {
                 Text("No apps are playing audio")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
@@ -205,18 +204,24 @@ private struct AppRow: View {
 
 private struct PermissionRow: View {
     var body: some View {
-        MenuRow(action: AudioCapturePermission.openPrivacySettings) {
-            HStack(spacing: 10) {
-                CircleIcon(symbol: "exclamationmark", tint: .orange, filled: true)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Allow Audio Capture")
-                        .font(.system(size: 13))
-                    Text("Needed to change per-app volume")
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                CircleIcon(symbol: "waveform", tint: .orange, filled: true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Allow System Audio Recording")
+                        .font(.system(size: 13, weight: .medium))
+                    Text("Volumist needs this permission to change each app's volume. Turn on Volumist under System Audio Recording Only in Privacy & Security.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            Button("Open Privacy & Security…", action: AudioCapturePermission.openPrivacySettings)
+                .controlSize(.small)
+                .padding(.leading, MenuMetrics.iconSize + 10)
         }
+        .padding(.horizontal, MenuMetrics.inset)
+        .padding(.vertical, 4)
     }
 }
 

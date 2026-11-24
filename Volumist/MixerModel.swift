@@ -120,9 +120,10 @@ final class MixerModel: ObservableObject {
         refreshVolume(.output)
         if !menuIsOpen { menuSession += 1 }
         menuIsOpen = true
-        // The status check can't always tell "granted" from "never asked"; asking settles it
-        // (instantly and silently when already granted).
-        if permission == .unknown { requestPermission() }
+        // The status check can't always tell "granted" from "never asked", and doesn't notice
+        // a permission turned on later in System Settings. Asking settles both: it answers
+        // instantly and silently once the user has decided, and only prompts the first time.
+        if permission != .authorized { requestPermission() }
         refreshApps()
         if levelTimer == nil {
             levelTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
