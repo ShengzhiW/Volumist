@@ -9,6 +9,10 @@ enum Preferences {
     static let showInputSection = "showInputSection"
     static let outputExpanded = "outputDevicesExpanded"
     static let inputExpanded = "inputDevicesExpanded"
+    /// How per-app volume works: the Volumist driver (default, when installed) or audio capture (taps).
+    static let audioEngine = "audioEngine"
+    static let engineDriver = "driver"
+    static let engineCapture = "capture"
 
     /// Slider snapping choices: 0 means continuous.
     static let volumeSteps: [(value: Double, label: String)] = [

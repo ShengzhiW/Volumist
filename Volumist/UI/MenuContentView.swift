@@ -30,7 +30,7 @@ struct MenuContentView: View {
             MenuSeparator()
             SectionHeader("Applications")
 
-            if model.permission == .denied {
+            if model.permission == .denied && !model.usingDriver {
                 // Per-app volume needs the permission; show only how to grant it.
                 PermissionRow()
             } else if model.apps.isEmpty {

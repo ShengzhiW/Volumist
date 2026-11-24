@@ -14,6 +14,8 @@ struct AppAudio: Identifiable {
     var pid: pid_t = 0
     var bundleURL: URL?
     var processObjectIDs: [AudioObjectID]
+    /// PIDs of the processes that play the app's audio (the app itself and its helpers).
+    var processPIDs: [pid_t] = []
     /// The app has an output stream running (it may be paused and playing silence).
     var isPlaying: Bool
     /// The app is actually making sound. Measured while the menu is open.
@@ -70,6 +72,23 @@ final class MixerModel: ObservableObject {
     @Published private(set) var hiddenDevices: [String: String] = [:]
     private static let hiddenDevicesKey = "hiddenDevices"
 
+    /// True while per-app volume runs through the Volumist audio driver instead of taps.
+    @Published private(set) var usingDriver = false
+    private var driver: DriverEngine?
+    private var driverTimer: Timer?
+    private var stoppingDriver = false
+    /// Which app each audio process belongs to, for matching the driver's per-process levels.
+    private var pidToApp: [pid_t: String] = [:]
+    private var lastDriverVolumeSequence: UInt32 = 0
+    private var lastPushedVolume: Float = -1
+    private var lastPushedMute = false
+    private var lastPushTime = Date.distantPast
+    private var workspaceObservers: [NSObjectProtocol] = []
+    /// The real output the driver's mix plays to, and whether the engine was running (so a
+    /// relaunch after a crash can go back to it instead of macOS's fallback device).
+    private static let realOutputKey = "driverRealOutputUID"
+    private static let engineActiveKey = "driverEngineActive"
+
     private static let settingsKey = "appSettings"
     private var settings: [String: AppSetting] = [:]
     /// Apps that have played audio this session stay listed while they have an audio client.
@@ -117,13 +136,21 @@ final class MixerModel: ObservableObject {
             },
         ]
 
+        // A newly launched app gets its saved volume before it makes a sound.
+        workspaceObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.publishRules() }
+        })
+
         refreshDevices()
         defaultDeviceChanged(.output)
         defaultDeviceChanged(.input)
-        refreshApps()
+        configureEngine()
     }
 
     func shutdown() {
+        stopDriver()
         stopLevelMonitoring()
         taps.values.forEach { $0.invalidate() }
         taps.removeAll()
@@ -142,7 +169,7 @@ final class MixerModel: ObservableObject {
         // The status check can't always tell "granted" from "never asked", and doesn't notice
         // a permission turned on later in System Settings. Asking settles both: it answers
         // instantly and silently once the user has decided, and only prompts the first time.
-        if permission != .authorized { requestPermission() }
+        if permission != .authorized, driver == nil { requestPermission() }
         refreshApps()
         if levelTimer == nil {
             levelTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
@@ -193,7 +220,11 @@ final class MixerModel: ObservableObject {
             apps[index].volume = setting.volume
             apps[index].isMuted = setting.muted
         }
-        if let entry = latest[appID] { ensureTap(for: entry) }
+        if driver != nil {
+            publishRules()
+        } else if let entry = latest[appID] {
+            ensureTap(for: entry)
+        }
     }
 
     private func scheduleRefresh() {
@@ -219,11 +250,15 @@ final class MixerModel: ObservableObject {
         }
 
         var grouped: [String: AppAudio] = [:]
+        var pids: [pid_t: String] = [:]
         for process in processes {
             guard let app = AudioProcesses.owningApplication(for: process) else { continue }
             let key = app.bundleIdentifier ?? "pid:\(app.processIdentifier)"
+            pids[process.pid] = key
+            pids[app.processIdentifier] = key
             if grouped[key] != nil {
                 grouped[key]!.processObjectIDs.append(process.objectID)
+                grouped[key]!.processPIDs.append(process.pid)
                 grouped[key]!.isPlaying = grouped[key]!.isPlaying || process.isRunningOutput
             } else {
                 let setting = settings[key] ?? AppSetting()
@@ -234,6 +269,7 @@ final class MixerModel: ObservableObject {
                     pid: app.processIdentifier,
                     bundleURL: app.bundleURL,
                     processObjectIDs: [process.objectID],
+                    processPIDs: [process.pid],
                     isPlaying: process.isRunningOutput,
                     nowPlaying: nowPlaying.titles[key],
                     volume: setting.volume,
@@ -244,6 +280,7 @@ final class MixerModel: ObservableObject {
 
         for (key, entry) in grouped where entry.isPlaying { seen.insert(key) }
         latest = grouped
+        pidToApp = pids
         apps = grouped.values
             .filter { $0.isPlaying || seen.contains($0.id) || settings[$0.id] != nil }
             .filter { !hiddenApps.contains($0.id) }
@@ -251,7 +288,11 @@ final class MixerModel: ObservableObject {
         refreshKnownApps()
 
         nowPlaying.track(running: Set(grouped.keys))
-        syncTaps()
+        if driver != nil {
+            publishRules()
+        } else {
+            syncTaps()
+        }
         updateLevelMonitor()
     }
 
@@ -259,7 +300,8 @@ final class MixerModel: ObservableObject {
 
     /// Meters every listed app whose output stream is running, while the menu is open.
     private func updateLevelMonitor() {
-        guard menuIsOpen, permission == .authorized else {
+        // With the driver, levels come from the driver itself (see readLevels), no taps needed.
+        guard driver == nil, menuIsOpen, permission == .authorized else {
             levelMonitor?.invalidate()
             levelMonitor = nil
             monitoredProcesses = [:]
@@ -284,8 +326,15 @@ final class MixerModel: ObservableObject {
     }
 
     private func readLevels() {
-        guard let levelMonitor else { return }
         let now = Date()
+        if let driver {
+            for peak in driver.takePeaks() where peak.level > Self.audibleThreshold {
+                if let key = pidToApp[peak.pid] ?? pidToApp[peak.ownerPID] { lastHeard[key] = now }
+            }
+            applyAudible()
+            return
+        }
+        guard let levelMonitor else { return }
         for (key, peak) in levelMonitor.takePeaks() where peak > Self.audibleThreshold {
             lastHeard[key] = now
         }
@@ -297,7 +346,9 @@ final class MixerModel: ObservableObject {
         for index in apps.indices {
             let app = apps[index]
             let audible: Bool
-            if levelMonitor == nil {
+            if driver != nil {
+                audible = app.isPlaying && (lastHeard[app.id].map { now.timeIntervalSince($0) < Self.audibleHold } ?? false)
+            } else if levelMonitor == nil {
                 // Can't measure (menu closed or no permission): trust the stream state.
                 audible = app.isPlaying
             } else if monitoredProcesses[app.id] != nil {
@@ -383,6 +434,18 @@ final class MixerModel: ObservableObject {
     }
 
     #if DEBUG
+    func debugEngineReport() -> [String] {
+        guard let driver else { return ["engine: not running"] }
+        let stats = driver.stats
+        var lines = [String(format: "engine: underruns=%llu resyncs=%llu lag=%.0f target=%u ratio=%.6f",
+                            stats.underruns, stats.resyncs, stats.lagFrames, stats.targetFrames, stats.ratio)]
+        for peak in driver.takePeaks() {
+            lines.append(String(format: "peak pid=%d owner=%d level=%.4f app=%@", peak.pid, peak.ownerPID, peak.level,
+                                pidToApp[peak.pid] ?? pidToApp[peak.ownerPID] ?? "?"))
+        }
+        return lines
+    }
+
     /// For previews and offscreen renders.
     func overrideAppsForPreview(_ apps: [AppAudio]) { self.apps = apps }
     #endif
@@ -396,6 +459,11 @@ final class MixerModel: ObservableObject {
     // MARK: - Taps
 
     private func syncTaps() {
+        if driver != nil {
+            taps.values.forEach { $0.invalidate() }
+            taps.removeAll()
+            return
+        }
         for key in Array(taps.keys) where latest[key] == nil {
             taps.removeValue(forKey: key)?.invalidate()
         }
@@ -459,6 +527,11 @@ final class MixerModel: ObservableObject {
     // MARK: - Devices
 
     func select(_ device: AudioDevice) {
+        // With the driver, Volumist stays the default output; picking a device changes where its mix plays.
+        if driver != nil, device.direction == .output {
+            useRealOutput(device)
+            return
+        }
         AudioDevices.setDefault(device)
     }
 
@@ -470,6 +543,7 @@ final class MixerModel: ObservableObject {
             $0.volume = value
             if value > 0 { $0.muted = false }
         }
+        if direction == .output { pushVolumeToDriver() }
     }
 
     func toggleMute(_ direction: AudioDirection) {
@@ -489,21 +563,40 @@ final class MixerModel: ObservableObject {
     private func refreshDevices() {
         output.devices = AudioDevices.all(.output)
         input.devices = AudioDevices.all(.input)
+        // The real output went away (unplugged, Bluetooth off): play the mix somewhere that exists.
+        if driver != nil, !output.devices.contains(where: { $0.id == output.selectedID }),
+           let fallback = output.devices.first(where: { $0.transportType == kAudioDeviceTransportTypeBuiltIn }) ?? output.devices.first {
+            useRealOutput(fallback)
+        }
     }
 
     private func defaultDeviceChanged(_ direction: AudioDirection) {
         let id = AudioDevices.defaultDeviceID(direction)
+        if direction == .output, driver != nil, !stoppingDriver {
+            // Volumist itself is the default: nothing to do. Anything else means the user picked an
+            // output in the system Sound menu (or macOS fell back): play the mix there, and
+            // driverTick makes Volumist the default again.
+            if id != DriverEngine.deviceID, let device = AudioDevices.device(for: id, .output),
+               device.uid != AudioDevices.volumistDeviceUID, device.id != output.selectedID {
+                useRealOutput(device)
+            }
+            return
+        }
         update(direction) { $0.selectedID = id }
         // Only the output has a volume control in the menu.
         guard direction == .output else { return }
+        watchOutputVolume(id)
+        refreshVolume(.output)
+        // Re-route every tap to the new output.
+        syncTaps()
+    }
+
+    private func watchOutputVolume(_ id: AudioObjectID) {
         outputVolumeListeners = [AudioDevices.volumeAddress(.output), AudioDevices.muteAddress(.output)].map { address in
             PropertyListener(id, address) { [weak self] in
                 MainActor.assumeIsolated { self?.refreshVolume(.output) }
             }
         }
-        refreshVolume(.output)
-        // Re-route every tap to the new output.
-        syncTaps()
     }
 
     private func refreshVolume(_ direction: AudioDirection) {
@@ -513,6 +606,139 @@ final class MixerModel: ObservableObject {
             $0.volume = Double(AudioDevices.volume(id, direction))
             $0.muted = AudioDevices.isMuted(id, direction)
         }
+        if direction == .output { pushVolumeToDriver() }
+    }
+
+    // MARK: - Audio driver
+
+    /// Uses the Volumist driver when it's installed (unless Settings chooses audio capture), else taps.
+    func configureEngine() {
+        let wantDriver = UserDefaults.standard.string(forKey: Preferences.audioEngine) != Preferences.engineCapture
+            && DriverEngine.isInstalled
+        if wantDriver, driver == nil { startDriver() }
+        if !wantDriver, driver != nil { stopDriver() }
+        usingDriver = driver != nil
+        refreshApps()
+    }
+
+    private func startDriver() {
+        guard let real = initialRealOutput(), let engine = DriverEngine() else {
+            log.error("Couldn't start the driver engine")
+            return
+        }
+        driver = engine
+        usingDriver = true
+        taps.values.forEach { $0.invalidate() }
+        taps.removeAll()
+        levelMonitor?.invalidate()
+        levelMonitor = nil
+        monitoredProcesses = [:]
+        UserDefaults.standard.set(true, forKey: Self.engineActiveKey)
+        lastDriverVolumeSequence = 0
+        lastPushedVolume = -1
+        useRealOutput(real)
+        driverTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.driverTick() }
+        }
+        publishRules()
+        log.info("Driver engine started, playing to \(real.name, privacy: .public)")
+    }
+
+    /// Gives the default output back to the real device, then removes the Volumist device.
+    private func stopDriver() {
+        guard let engine = driver else { return }
+        stoppingDriver = true
+        driverTimer?.invalidate()
+        driverTimer = nil
+        if let real = AudioDevices.device(for: output.selectedID, .output) {
+            AudioDevices.setDefault(real)
+        }
+        engine.shutdown()
+        driver = nil
+        usingDriver = false
+        UserDefaults.standard.set(false, forKey: Self.engineActiveKey)
+        stoppingDriver = false
+        defaultDeviceChanged(.output)
+    }
+
+    private func initialRealOutput() -> AudioDevice? {
+        let candidates = AudioDevices.all(.output)
+        let savedUID = UserDefaults.standard.string(forKey: Self.realOutputKey)
+        let saved = candidates.first { $0.uid == savedUID }
+        // Last run ended without stopping the engine (a crash): macOS will have fallen back to
+        // the built-in output, so go back to the device the user was actually using.
+        if UserDefaults.standard.bool(forKey: Self.engineActiveKey), let saved { return saved }
+        let current = AudioDevices.defaultDeviceID(.output)
+        return candidates.first { $0.id == current }
+            ?? saved
+            ?? candidates.first { $0.transportType == kAudioDeviceTransportTypeBuiltIn }
+            ?? candidates.first
+    }
+
+    private func useRealOutput(_ device: AudioDevice) {
+        guard let driver else { return }
+        if !driver.setOutput(device.id) {
+            log.error("Couldn't play to \(device.name, privacy: .public)")
+        }
+        UserDefaults.standard.set(device.uid, forKey: Self.realOutputKey)
+        output.selectedID = device.id
+        watchOutputVolume(device.id)
+        refreshVolume(.output)
+    }
+
+    private func driverTick() {
+        guard let driver else { return }
+        // Make the Volumist device the default output once the driver has published it.
+        if driver.isDeviceVisible, let volumist = DriverEngine.deviceID, AudioDevices.defaultDeviceID(.output) != volumist {
+            AudioDevices.setDefaultOutput(volumist)
+        }
+        // The Volumist device's own volume changed (volume keys, Sound menu): apply it to the
+        // real output. Ignore echoes of what we pushed ourselves.
+        let sequence = driver.volumeSequence
+        guard sequence != lastDriverVolumeSequence else { return }
+        lastDriverVolumeSequence = sequence
+        let volume = driver.volume, muted = driver.isMuted
+        let isEcho = abs(volume - lastPushedVolume) < 0.0005 && muted == lastPushedMute
+        let pushedJustNow = Date().timeIntervalSince(lastPushTime) < 0.5
+        guard !isEcho, !pushedJustNow, output.selectedID != .unknown else { return }
+        AudioDevices.setVolume(output.selectedID, .output, volume)
+        AudioDevices.setMuted(output.selectedID, .output, muted)
+        refreshVolume(.output)
+    }
+
+    /// Shows the real output's volume on the Volumist device (what the volume keys adjust).
+    private func pushVolumeToDriver() {
+        guard let driver else { return }
+        let volume = Float(output.volume), muted = output.muted
+        if volume != lastPushedVolume || muted != lastPushedMute { lastPushTime = Date() }
+        lastPushedVolume = volume
+        lastPushedMute = muted
+        driver.pushVolume(volume, muted: muted)
+    }
+
+    /// Publishes every adjusted app's gain to the driver: by bundle ID (covers an app's own
+    /// process even before we've seen it), by the app's PID, and by the PIDs of its helper
+    /// processes (e.g. Safari's WebKit GPU process).
+    private func publishRules() {
+        guard let driver else { return }
+        var rules: [DriverEngine.Rule] = []
+        var seenKeys: Set<String> = []
+        func add(_ rule: DriverEngine.Rule) {
+            let key = "\(rule.pid)|\(rule.bundleID ?? "")"
+            if seenKeys.insert(key).inserted { rules.append(rule) }
+        }
+        let running = NSWorkspace.shared.runningApplications
+        for (key, setting) in settings {
+            let gain = setting.gain
+            if key.hasPrefix("pid:") {
+                if let pid = pid_t(key.dropFirst(4)) { add(.init(pid: pid, gain: gain)) }
+            } else {
+                add(.init(bundleID: key, gain: gain))
+                for app in running where app.bundleIdentifier == key { add(.init(pid: app.processIdentifier, gain: gain)) }
+            }
+            for pid in latest[key]?.processPIDs ?? [] { add(.init(pid: pid, gain: gain)) }
+        }
+        driver.setRules(rules)
     }
 
     // MARK: - Misc

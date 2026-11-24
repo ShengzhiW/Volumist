@@ -119,9 +119,23 @@ struct GeneralSettingsView: View {
     @AppStorage(Preferences.appVolumeStep) private var appVolumeStep = 0.0
     @AppStorage(Preferences.showOutputSection) private var showOutputSection = true
     @AppStorage(Preferences.showInputSection) private var showInputSection = true
+    @AppStorage(Preferences.audioEngine) private var audioEngine = Preferences.engineDriver
 
     var body: some View {
         Form {
+            Section {
+                Picker("Change app volumes with", selection: $audioEngine) {
+                    Text("Volumist audio driver").tag(Preferences.engineDriver)
+                    Text("Audio capture").tag(Preferences.engineCapture)
+                }
+                .onChange(of: audioEngine) { model.configureEngine() }
+            } header: {
+                Text("Audio Engine")
+            } footer: {
+                Text(engineStatus)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Section("Volume Sliders") {
                 StepPicker(title: "Main volume", selection: $mainVolumeStep)
                 StepPicker(title: "App volume", selection: $appVolumeStep)
@@ -141,6 +155,16 @@ struct GeneralSettingsView: View {
         .frame(width: 480)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear { model.refreshLaunchAtLogin() }
+    }
+
+    private var engineStatus: String {
+        if !DriverEngine.isInstalled {
+            return "The Volumist audio driver isn't installed, so audio capture is used. It needs the System Audio Recording permission and shows the recording indicator while active."
+        }
+        if model.usingDriver {
+            return "Apps play through the Volumist device, which applies each app's volume. No recording permission, no recording indicator."
+        }
+        return "Audio capture needs the System Audio Recording permission and shows the recording indicator while an app's volume is changed."
     }
 }
 

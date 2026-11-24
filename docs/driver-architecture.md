@@ -116,6 +116,16 @@ Findings that change the plan:
 
 **2. App output engine.** Ring buffer to real device, drift handling, default-device takeover and restore, volume and mute mirroring.
 
+*Phase 2 status (2026-11-24): working in the app.* `Volumist/Engine/VolumistEngine.c` (C, real-time) creates the shared memory and heartbeat and plays the driver's mix to the real output. It corrects drift by resampling: linear interpolation with a proportional controller on the buffered amount, ±0.3% max, and a target of about 21 ms that grows with the driver's burst size. `DriverEngine.swift` wraps it, and `MixerModel` uses it whenever the driver is installed (Settings › General › Audio Engine can choose audio capture instead).
+
+- **Offline engine tests** (`Driver/Tests/EngineTests.c`, 37 checks, run by `Driver/build.sh --test`): drift from −2000 to +500 ppm is tracked exactly on average, with no dropouts or clicks over 10 simulated minutes per case. Also covered: 128- and 1024-frame buffers, pause/restart, split and mono outputs, in-place rule updates, peaks.
+- **In the app** (`--driver-report` debug mode plus normal use): Volumist becomes the default output within 1.5 s and routes to the real device; the Volumist device is hidden from the menu. 0 dropouts, buffer on target, ratio settled at 0.99996 (≈ −40 ppm, as the spike measured). Safari's level arrives through the driver, so the waveform needs no capture.
+- **Quit:** the default output goes back to the real device before the Volumist device disappears.
+- **Crash:** `kill -9` makes the device vanish in about 0.7 s; on relaunch the app returns to the saved real device (it keeps an "engine active" flag to tell a crash from a clean quit).
+- **By ear:** Safari's slider and mute work, and there's **no purple dot** and no permission prompt.
+- Each start logs one resync while apps' streams move to the Volumist device; possibly a brief blip.
+- Still to check by ear: the volume keys mirroring to the real device (the in-process tests cover the driver side).
+
 **3. Port features.** Per-app volume and mute through the control block; levels from the driver; drop the audio-capture permission UI on this path.
 
 **4. Installer.** Package, Settings status and install/uninstall, restarting `coreaudiod`.

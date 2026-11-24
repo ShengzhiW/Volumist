@@ -10,6 +10,11 @@ enum SelfTest {
     /// Tests that need a fully launched app.
     @MainActor static func runAfterLaunchIfRequested(model: MixerModel) {
         let args = CommandLine.arguments
+        if let index = args.firstIndex(of: "--driver-report"), args.count > index + 2 {
+            runDriverReport(model: model, report: URL(fileURLWithPath: args[index + 1]),
+                            outputUID: args[index + 2], seconds: args.count > index + 3 ? Double(args[index + 3]) ?? 8 : 8)
+            return
+        }
         if let index = args.firstIndex(of: "--settings-snapshot"), args.count > index + 1 {
             SettingsWindowController(model: model).snapshotTabs(to: URL(fileURLWithPath: args[index + 1]))
             exit(0)
@@ -75,6 +80,31 @@ enum SelfTest {
         }
         note("done")
         exit(0)
+    }
+}
+
+/// `Volumist --driver-report <report.txt> <real output UID or -> [seconds]`: with the driver engine,
+/// routes the mix to the given device (or leaves the app's own choice for "-"), runs for a while, reports routing and engine figures, then
+/// quits normally (so the default output should be handed back to the real device).
+@MainActor private func runDriverReport(model: MixerModel, report: URL, outputUID: String, seconds: Double) {
+    var lines: [String] = []
+    func name(_ id: AudioObjectID) -> String { CA.getString(id, CA.address(kAudioObjectPropertyName)) ?? "id \(id)" }
+    lines.append("usingDriver: \(model.usingDriver)")
+    // "-" keeps whatever real output the app chose on its own (e.g. after a crash).
+    if outputUID != "-", let device = AudioDevices.all(.output).first(where: { $0.uid == outputUID }) { model.select(device) }
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+        lines.append("volumist device visible: \(DriverEngine.deviceID != nil)")
+        lines.append("default output: \(name(AudioDevices.defaultDeviceID(.output)))")
+        lines.append("real output (menu selection): \(model.output.selected?.name ?? "none")")
+        lines.append("Volumist device listed in menu: \(model.output.devices.contains { $0.uid == AudioDevices.volumistDeviceUID })")
+        lines.append(contentsOf: model.debugEngineReport())
+        model.shutdown()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            lines.append("after quit, default output: \(name(AudioDevices.defaultDeviceID(.output)))")
+            lines.append("after quit, volumist device visible: \(DriverEngine.deviceID != nil)")
+            try? lines.joined(separator: "\n").write(to: report, atomically: true, encoding: .utf8)
+            exit(0)
+        }
     }
 }
 

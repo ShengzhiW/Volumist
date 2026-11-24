@@ -53,10 +53,14 @@ struct AudioDevice: Identifiable, Hashable {
 enum AudioDevices {
     /// UID prefix of the private aggregate devices Volumist creates, so they never show up in the list.
     static let privateUIDPrefix = "app.volumist.aggregate."
+    /// The Volumist driver's device: the default output while the driver engine runs, so it's
+    /// left out of device lists (the menu shows the real device its mix plays to instead).
+    static let volumistDeviceUID = "app.volumist.device"
 
     static func all(_ direction: AudioDirection) -> [AudioDevice] {
         let ids = CA.getArray(.system, CA.address(kAudioHardwarePropertyDevices), zero: AudioObjectID.unknown)
-        let devices = ids.compactMap { device(for: $0, direction) }.filter { !$0.uid.hasPrefix(privateUIDPrefix) }
+        let devices = ids.compactMap { device(for: $0, direction) }
+            .filter { !$0.uid.hasPrefix(privateUIDPrefix) && $0.uid != volumistDeviceUID }
         // Like the system menu: built-in devices first, everything else in Core Audio's order.
         return devices.filter { $0.transportType == kAudioDeviceTransportTypeBuiltIn }
             + devices.filter { $0.transportType != kAudioDeviceTransportTypeBuiltIn }
@@ -81,6 +85,10 @@ enum AudioDevices {
 
     static func setDefault(_ device: AudioDevice) {
         CA.set(.system, CA.address(device.direction.defaultDeviceSelector), device.id)
+    }
+
+    static func setDefaultOutput(_ id: AudioObjectID) {
+        CA.set(.system, CA.address(kAudioHardwarePropertyDefaultOutputDevice), id)
     }
 
     // MARK: Volume
