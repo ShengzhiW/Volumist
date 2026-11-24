@@ -1,6 +1,6 @@
 import Foundation
 
-/// Track titles for media players that publish them.
+/// "Artist — Song" (or just the song) for media players that publish it.
 ///
 /// The system-wide now-playing API (MediaRemote) is private and no longer answers
 /// third-party apps, so this covers the players that broadcast their state: Music,
@@ -20,6 +20,7 @@ final class NowPlayingMonitor {
         Player(bundleID: "com.apple.TV", notification: "com.apple.TV.playerInfo"),
     ]
 
+    /// Display text per bundle ID.
     private(set) var titles: [String: String] = [:]
     var onChange: (() -> Void)?
 
@@ -34,9 +35,14 @@ final class NowPlayingMonitor {
             observers.append(center.addObserver(forName: .init(player.notification), object: nil, queue: .main) { [weak self] note in
                 let state = note.userInfo?["Player State"] as? String
                 let name = note.userInfo?["Name"] as? String
+                let artist = note.userInfo?["Artist"] as? String
                 MainActor.assumeIsolated {
                     self?.primed.insert(bundleID)
-                    self?.set(state == "Stopped" ? nil : name, for: bundleID)
+                    if state == "Stopped" {
+                        self?.set(nil, artist: nil, for: bundleID)
+                    } else {
+                        self?.set(name, artist: artist, for: bundleID)
+                    }
                 }
             })
         }
@@ -47,7 +53,7 @@ final class NowPlayingMonitor {
         // Forget players that quit so a relaunch is queried again.
         for id in primed where !bundleIDs.contains(id) {
             primed.remove(id)
-            set(nil, for: id)
+            set(nil, artist: nil, for: id)
         }
         for player in Self.players where bundleIDs.contains(player.bundleID) && !primed.contains(player.bundleID) {
             primed.insert(player.bundleID)
@@ -60,7 +66,14 @@ final class NowPlayingMonitor {
         if application id "\(bundleID)" is running then
             with timeout of 3 seconds
                 tell application id "\(bundleID)"
-                    if player state is not stopped then return name of current track
+                    if player state is not stopped then
+                        set songName to name of current track
+                        set artistName to ""
+                        try
+                            set artistName to artist of current track
+                        end try
+                        return artistName & tab & songName
+                    end if
                 end tell
             end timeout
         end if
@@ -71,18 +84,28 @@ final class NowPlayingMonitor {
             let result = NSAppleScript(source: source)?.executeAndReturnError(&error).stringValue
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
-                    guard let self, self.titles[bundleID] == nil else { return }
-                    self.set(result, for: bundleID)
+                    guard let self, self.titles[bundleID] == nil, let result else { return }
+                    let parts = result.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+                    if parts.count == 2 {
+                        self.set(parts[1], artist: parts[0], for: bundleID)
+                    } else {
+                        self.set(result, artist: nil, for: bundleID)
+                    }
                 }
             }
         }
     }
 
-    private func set(_ title: String?, for bundleID: String) {
-        let cleaned = title?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let value = (cleaned?.isEmpty ?? true) ? nil : cleaned
+    private func set(_ title: String?, artist: String?, for bundleID: String) {
+        let song = Self.clean(title)
+        let value = song.map { song in Self.clean(artist).map { "\($0) — \(song)" } ?? song }
         guard titles[bundleID] != value else { return }
         titles[bundleID] = value
         onChange?()
+    }
+
+    private static func clean(_ text: String?) -> String? {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

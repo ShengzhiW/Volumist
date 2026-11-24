@@ -143,14 +143,23 @@ private struct AppList: View {
 private struct AppRow: View {
     @EnvironmentObject private var model: MixerModel
     let app: AppAudio
+    @State private var iconHovered = false
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(nsImage: app.icon)
-                .resizable()
-                .interpolation(.high)
-                .frame(width: 28, height: 28)
-                .opacity(app.isMuted ? 0.45 : 1)
+            Button { model.open(app) } label: {
+                Image(nsImage: app.icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 28, height: 28)
+                    .opacity(app.isMuted ? 0.45 : 1)
+                    .brightness(iconHovered ? -0.06 : 0)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { iconHovered = $0 }
+            .help("Open \(app.name)")
+            .accessibilityLabel("Open \(app.name)")
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
@@ -167,7 +176,7 @@ private struct AppRow: View {
                     }
                     if let title = app.nowPlaying {
                         // Fills the space up to the percentage, fading out if it's longer.
-                        FadingText(title)
+                        MarqueeText(title, scrolls: app.isAudible, session: model.menuSession)
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                             .padding(.leading, 2)
@@ -310,30 +319,65 @@ struct VolumeLabel: View {
     }
 }
 
-/// Single-line text that fills the width it's offered and, when the text is longer,
-/// fades out at the trailing edge instead of truncating with an ellipsis.
-struct FadingText: View {
+/// Single-line text that fills the width it's offered. When the text is longer, it fades
+/// out at the trailing edge, and while `scrolls` is on it scrolls through once per menu
+/// session (`session`) and then eases back to the start.
+struct MarqueeText: View {
     let text: String
+    let scrolls: Bool
+    let session: Int
+
     private let fadeWidth: CGFloat = 18
+    private let pointsPerSecond: CGFloat = 30
     @State private var textWidth: CGFloat = 0
     @State private var availableWidth: CGFloat = 0
+    @State private var offset: CGFloat = 0
 
-    init(_ text: String) { self.text = text }
+    init(_ text: String, scrolls: Bool, session: Int) {
+        self.text = text
+        self.scrolls = scrolls
+        self.session = session
+    }
+
+    private struct Run: Equatable {
+        let text: String
+        let session: Int
+        let canScroll: Bool
+    }
 
     var body: some View {
-        let overflows = textWidth > availableWidth + 0.5
+        let overflow = max(textWidth - availableWidth, 0)
+        let overflows = overflow > 0.5
         Text(text)
             .lineLimit(1)
             .fixedSize()
             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { textWidth = $0 }
+            .offset(x: offset)
             .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { availableWidth = $0 }
             .clipped()
             .mask {
                 HStack(spacing: 0) {
+                    LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: offset < 0 ? fadeWidth : 0)
                     Rectangle()
                     LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
                         .frame(width: overflows ? fadeWidth : 0)
+                }
+            }
+            .task(id: Run(text: text, session: session, canScroll: scrolls && overflows)) {
+                offset = 0
+                guard scrolls, overflows else { return }
+                // Travel far enough that the last character clears the trailing fade.
+                let distance = overflow + fadeWidth
+                let duration = Double(distance / pointsPerSecond)
+                do {
+                    try await Task.sleep(for: .seconds(1.2))
+                    withAnimation(.linear(duration: duration)) { offset = -distance }
+                    try await Task.sleep(for: .seconds(duration + 1.5))
+                    withAnimation(.easeInOut(duration: 0.4)) { offset = 0 }
+                } catch {
+                    offset = 0
                 }
             }
             .accessibilityLabel(text)

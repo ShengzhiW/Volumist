@@ -10,6 +10,9 @@ struct AppAudio: Identifiable {
     let id: String
     var name: String
     var icon: NSImage
+    /// The app the user sees (not the helper process that plays the audio).
+    var pid: pid_t = 0
+    var bundleURL: URL?
     var processObjectIDs: [AudioObjectID]
     /// The app has an output stream running (it may be paused and playing silence).
     var isPlaying: Bool
@@ -46,6 +49,8 @@ final class MixerModel: ObservableObject {
     @Published private(set) var output = DeviceState(direction: .output)
     @Published private(set) var input = DeviceState(direction: .input)
     @Published private(set) var permission: AudioCapturePermission = .unknown
+    /// Increments each time the menu opens (restarts one-shot animations like title scrolling).
+    @Published private(set) var menuSession = 0
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     private static let settingsKey = "appSettings"
@@ -113,6 +118,7 @@ final class MixerModel: ObservableObject {
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
         refreshVolume(.output)
+        if !menuIsOpen { menuSession += 1 }
         menuIsOpen = true
         // The status check can't always tell "granted" from "never asked"; asking settles it
         // (instantly and silently when already granted).
@@ -138,6 +144,17 @@ final class MixerModel: ObservableObject {
         setting.volume = min(max(volume, 0), 1)
         if setting.volume > 0 { setting.muted = false }
         update(setting, for: appID)
+    }
+
+    /// Brings the app forward, like clicking it in the Dock (reopens a window if it has none).
+    func open(_ app: AppAudio) {
+        if let url = app.bundleURL {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+        } else {
+            NSRunningApplication(processIdentifier: app.pid)?.activate()
+        }
     }
 
     func toggleMute(for appID: String) {
@@ -194,6 +211,8 @@ final class MixerModel: ObservableObject {
                     id: key,
                     name: app.localizedName ?? key,
                     icon: app.icon ?? NSWorkspace.shared.icon(for: .application),
+                    pid: app.processIdentifier,
+                    bundleURL: app.bundleURL,
                     processObjectIDs: [process.objectID],
                     isPlaying: process.isRunningOutput,
                     nowPlaying: nowPlaying.titles[key],
