@@ -104,6 +104,16 @@ Findings that change the plan:
 
 **1. Driver MVP.** Virtual device, client table, per-client gain, mix into the ring buffer, heartbeat, remove the device on disconnect.
 
+*Phase 1 status (2026-11-24): done.* The driver lives in `Driver/` (`build.sh --test` builds it and runs 43 in-process tests; `make-installer.sh` builds the packages and the `vd-host` test host). Verified on this Mac with `vd-host` standing in for the app:
+
+- **No device until the app runs:** with nothing running there is no "Volumist" device. It appears about 0.8 s after the host starts, once the shared memory and heartbeat exist.
+- **Crash safety:** after `kill -9` of the host, the device vanished in 0.4–0.6 s (the driver sees the dead PID before the 1.5 s heartbeat timeout) and Safari carried on playing through a real device. **macOS falls back to the built-in speakers**, not the previous device, so the app should restore the user's chosen output when it relaunches.
+- **Gains from the first buffer:** with "Safari 30%" published before playback, Safari's audio was quiet from the first sound (log: gain 0.30 on the first report). By ear: "quiet from the start".
+- **Sample rate follows the real output:** it switched to 44.1 kHz for BlackHole and stayed at 48 kHz for the Audioengine.
+- **Owner lookup works inside coreaudiod's sandbox** (`ownerLookupWorks = 1`). The app still publishes rules for an app's helper processes itself (`owner` rules in `vd-host`), which covers helpers the driver reports as their own owner.
+- Not yet verified on the real system: volume keys mirrored to the real device (covered by the in-process tests).
+- **Security is still open:** the shared memory is created world-readable/writable (0666) so the `_coreaudiod` driver can open it, which lets any local process read the mix or change gains. Before shipping, hand the driver a file descriptor over a socket and verify the app's code signature instead of using a named region.
+
 **2. App output engine.** Ring buffer to real device, drift handling, default-device takeover and restore, volume and mute mirroring.
 
 **3. Port features.** Per-app volume and mute through the control block; levels from the driver; drop the audio-capture permission UI on this path.
