@@ -65,6 +65,10 @@ final class MixerModel: ObservableObject {
     /// Bundle IDs of apps the user hid from the menu. Their volume settings still apply.
     @Published private(set) var hiddenApps: Set<String> = []
     private static let hiddenAppsKey = "hiddenApps"
+    /// Devices hidden from the menu, keyed "output:<UID>" / "input:<UID>", with their names
+    /// so hidden devices that are unplugged can still be listed in Settings.
+    @Published private(set) var hiddenDevices: [String: String] = [:]
+    private static let hiddenDevicesKey = "hiddenDevices"
 
     private static let settingsKey = "appSettings"
     private var settings: [String: AppSetting] = [:]
@@ -90,6 +94,7 @@ final class MixerModel: ObservableObject {
 
     init() {
         hiddenApps = Set(UserDefaults.standard.stringArray(forKey: Self.hiddenAppsKey) ?? [])
+        hiddenDevices = UserDefaults.standard.dictionary(forKey: Self.hiddenDevicesKey) as? [String: String] ?? [:]
         if let data = UserDefaults.standard.data(forKey: Self.settingsKey),
            let saved = try? JSONDecoder().decode([String: AppSetting].self, from: data) {
             settings = saved
@@ -311,6 +316,48 @@ final class MixerModel: ObservableObject {
         levelMonitor = nil
         monitoredProcesses = [:]
         lastHeard = [:]
+    }
+
+    // MARK: - Hidden devices
+
+    /// A device row for Settings › Devices; `device` is nil when it isn't connected.
+    struct DeviceListing: Identifiable {
+        let id: String
+        let name: String
+        let device: AudioDevice?
+    }
+
+    private static func hiddenKey(_ direction: AudioDirection, _ uid: String) -> String {
+        "\(direction == .output ? "output" : "input"):\(uid)"
+    }
+
+    func isHidden(_ device: AudioDevice) -> Bool {
+        hiddenDevices[Self.hiddenKey(device.direction, device.uid)] != nil
+    }
+
+    func setHidden(_ hidden: Bool, listing: DeviceListing) {
+        hiddenDevices[listing.id] = hidden ? listing.name : nil
+        UserDefaults.standard.set(hiddenDevices, forKey: Self.hiddenDevicesKey)
+    }
+
+    /// Devices to list in the menu: everything not hidden, plus the device in use.
+    func menuDevices(_ direction: AudioDirection) -> [AudioDevice] {
+        let current = direction == .output ? output : input
+        return current.devices.filter { !isHidden($0) || $0.id == current.selectedID }
+    }
+
+    /// Connected devices plus hidden ones that aren't connected right now.
+    func deviceListings(_ direction: AudioDirection) -> [DeviceListing] {
+        let current = direction == .output ? output : input
+        var listings = current.devices.map {
+            DeviceListing(id: Self.hiddenKey(direction, $0.uid), name: $0.name, device: $0)
+        }
+        let connected = Set(listings.map(\.id))
+        let prefix = Self.hiddenKey(direction, "")
+        for (key, name) in hiddenDevices where key.hasPrefix(prefix) && !connected.contains(key) {
+            listings.append(DeviceListing(id: key, name: name, device: nil))
+        }
+        return listings
     }
 
     // MARK: - Hidden apps

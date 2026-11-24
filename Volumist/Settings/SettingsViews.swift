@@ -51,6 +51,66 @@ struct AppsSettingsView: View {
     }
 }
 
+// MARK: - Devices
+
+struct DevicesSettingsView: View {
+    @EnvironmentObject private var model: MixerModel
+
+    var body: some View {
+        Form {
+            Section {
+                rows(.output)
+            } header: {
+                Text("Output")
+            } footer: {
+                Text("Hidden devices don't appear in the menu. The device in use always does.")
+                    .foregroundStyle(.secondary)
+            }
+            Section("Input") {
+                rows(.input)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 480)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private func rows(_ direction: AudioDirection) -> some View {
+        let selectedID = direction == .output ? model.output.selectedID : model.input.selectedID
+        ForEach(model.deviceListings(direction)) { listing in
+            let inUse = listing.device?.id == selectedID
+            HStack(spacing: 10) {
+                Image(systemName: listing.device?.symbolName ?? (direction == .output ? "speaker.wave.2.fill" : "mic.fill"))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(listing.name)
+                    if listing.device == nil {
+                        Text("Not connected")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if inUse {
+                    Text("In use")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Toggle("Show \(listing.name) in the menu", isOn: Binding(
+                    get: { model.hiddenDevices[listing.id] == nil },
+                    set: { model.setHidden(!$0, listing: listing) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .help("Show in menu")
+            }
+        }
+    }
+}
+
 // MARK: - General
 
 struct GeneralSettingsView: View {

@@ -5,7 +5,7 @@ A per-app volume mixer that lives in the macOS menu bar, laid out like the syste
 - **Sound**: volume for the current output device (follows the volume keys).
 - **Applications**: a slider and mute button for each app that's playing audio. Click an app's icon to open it. Music, Spotify and TV also show "Artist — Song"; a title too long to fit scrolls through once while the app is playing. Settings are remembered per app.
 - **Output** / **Input**: switch the default output or input device. Click a section header to show every device or just the selected one; Volumist remembers which.
-- **Settings** (from the menu): hide apps from the menu, make the main and per-app sliders snap to 5, 10 or 20% steps, show or hide the Output and Input sections, and turn on Open at Login.
+- **Settings** (from the menu): hide apps or output and input devices from the menu, make the main and per-app sliders snap to 5, 10 or 20% steps, show or hide the Output and Input sections, and turn on Open at Login.
 
 Requires macOS 15+. The first time you change an app's volume, macOS asks for permission to capture audio from other apps (System Settings › Privacy & Security › Screen & System Audio Recording).
 

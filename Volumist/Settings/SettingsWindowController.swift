@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// The Settings window: native toolbar tabs (Apps, General, About), each a SwiftUI view.
+/// The Settings window: native toolbar tabs (Apps, Devices, General, About), each a SwiftUI view.
 ///
 /// Volumist normally has no Dock icon. While Settings is open it becomes a regular app so
 /// the window can come forward, appear in ⌘-Tab, and take keyboard focus.
@@ -35,9 +35,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         let tabs = NSTabViewController()
         tabs.tabStyle = .toolbar
         tabs.addTabViewItem(tab("Apps", symbol: "square.grid.2x2", AppsSettingsView()))
+        tabs.addTabViewItem(tab("Devices", symbol: "hifispeaker.2", DevicesSettingsView()))
         tabs.addTabViewItem(tab("General", symbol: "gearshape", GeneralSettingsView()))
         tabs.addTabViewItem(tab("About", symbol: "info.circle", AboutSettingsView()))
-        tabs.selectedTabViewItemIndex = 1
+        tabs.selectedTabViewItemIndex = 2
 
         let window = NSWindow(contentViewController: tabs)
         window.styleMask = [.titled, .closable]

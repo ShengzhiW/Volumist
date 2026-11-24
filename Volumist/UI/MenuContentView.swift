@@ -234,13 +234,14 @@ private struct DeviceSection: View {
     @Binding var isExpanded: Bool
 
     var body: some View {
-        let others = state.devices.filter { $0.id != state.selectedID }
+        let devices = model.menuDevices(state.direction)
+        let others = devices.filter { $0.id != state.selectedID }
         let showAll = isExpanded || state.selected == nil
 
         DisclosureHeader(title: title, isExpanded: showAll, isEnabled: !others.isEmpty && state.selected != nil) {
             withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() }
         }
-        ForEach(showAll ? state.devices : state.selected.map { [$0] } ?? []) { device in
+        ForEach(showAll ? devices : state.selected.map { [$0] } ?? []) { device in
             DeviceRow(device: device, isSelected: device.id == state.selectedID) {
                 model.select(device)
             }
