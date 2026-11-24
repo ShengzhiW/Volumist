@@ -16,6 +16,17 @@ struct AppAudio: Identifiable {
     var isMuted: Bool
 }
 
+struct DeviceState {
+    let direction: AudioDirection
+    var devices: [AudioDevice] = []
+    var selectedID: AudioObjectID = .unknown
+    var volume: Double = 0
+    var muted = false
+    var volumeSettable = false
+
+    var selected: AudioDevice? { devices.first { $0.id == selectedID } }
+}
+
 struct AppSetting: Codable, Equatable {
     var volume: Double = 1
     var muted = false
@@ -28,11 +39,8 @@ struct AppSetting: Codable, Equatable {
 @MainActor
 final class MixerModel: ObservableObject {
     @Published private(set) var apps: [AppAudio] = []
-    @Published private(set) var devices: [OutputDevice] = []
-    @Published private(set) var defaultOutputID: AudioObjectID = .unknown
-    @Published private(set) var outputVolume: Double = 0
-    @Published private(set) var outputMuted = false
-    @Published private(set) var outputVolumeSettable = false
+    @Published private(set) var output = DeviceState(direction: .output)
+    @Published private(set) var input = DeviceState(direction: .input)
     @Published private(set) var permission: AudioCapturePermission = .unknown
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
 
@@ -47,7 +55,7 @@ final class MixerModel: ObservableObject {
 
     private var systemListeners: [PropertyListener] = []
     private var processListeners: [AudioObjectID: PropertyListener] = [:]
-    private var deviceListeners: [PropertyListener] = []
+    private var deviceListeners: [AudioDirection: [PropertyListener]] = [:]
 
     init() {
         if let data = UserDefaults.standard.data(forKey: Self.settingsKey),
@@ -64,12 +72,16 @@ final class MixerModel: ObservableObject {
                 MainActor.assumeIsolated { self?.refreshDevices() }
             },
             PropertyListener(.system, CA.address(kAudioHardwarePropertyDefaultOutputDevice)) { [weak self] in
-                MainActor.assumeIsolated { self?.defaultOutputChanged() }
+                MainActor.assumeIsolated { self?.defaultDeviceChanged(.output) }
+            },
+            PropertyListener(.system, CA.address(kAudioHardwarePropertyDefaultInputDevice)) { [weak self] in
+                MainActor.assumeIsolated { self?.defaultDeviceChanged(.input) }
             },
         ]
 
         refreshDevices()
-        defaultOutputChanged()
+        defaultDeviceChanged(.output)
+        defaultDeviceChanged(.input)
         refreshApps()
     }
 
@@ -85,7 +97,8 @@ final class MixerModel: ObservableObject {
             permission = current
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
-        refreshOutputVolume()
+        refreshVolume(.output)
+        refreshVolume(.input)
         refreshApps()
     }
 
@@ -184,7 +197,7 @@ final class MixerModel: ObservableObject {
         let setting = settings[entry.id] ?? AppSetting()
         let processIDs = entry.processObjectIDs.sorted()
 
-        if let tap = taps[entry.id], tap.processObjectIDs == processIDs, tap.outputDeviceID == defaultOutputID {
+        if let tap = taps[entry.id], tap.processObjectIDs == processIDs, tap.outputDeviceID == output.selectedID {
             tap.setGain(setting.gain)
             return
         }
@@ -192,7 +205,7 @@ final class MixerModel: ObservableObject {
         if taps[entry.id] == nil, setting.isDefault { return }
 
         guard canTap else { return }
-        guard let device = devices.first(where: { $0.id == defaultOutputID }) ?? OutputDevices.device(for: defaultOutputID) else { return }
+        guard let device = output.selected ?? AudioDevices.device(for: output.selectedID, .output) else { return }
 
         do {
             // Build the replacement before tearing down the old one so the app never blips to full volume.
@@ -227,45 +240,61 @@ final class MixerModel: ObservableObject {
         }
     }
 
-    // MARK: - Output devices
+    // MARK: - Devices
 
-    func selectOutput(_ device: OutputDevice) {
-        OutputDevices.setDefaultOutput(device.id)
+    func select(_ device: AudioDevice) {
+        AudioDevices.setDefault(device)
     }
 
-    func setOutputVolume(_ value: Double) {
-        guard defaultOutputID != .unknown else { return }
-        OutputDevices.setVolume(defaultOutputID, Float(value))
-        outputVolume = value
-        if value > 0 { outputMuted = false }
+    func setVolume(_ value: Double, _ direction: AudioDirection) {
+        let id = state(direction).selectedID
+        guard id != .unknown else { return }
+        AudioDevices.setVolume(id, direction, Float(value))
+        update(direction) {
+            $0.volume = value
+            if value > 0 { $0.muted = false }
+        }
     }
 
-    func toggleOutputMute() {
-        OutputDevices.setMuted(defaultOutputID, !outputMuted)
-        refreshOutputVolume()
+    func toggleMute(_ direction: AudioDirection) {
+        let current = state(direction)
+        AudioDevices.setMuted(current.selectedID, direction, !current.muted)
+        refreshVolume(direction)
+    }
+
+    private func state(_ direction: AudioDirection) -> DeviceState {
+        direction == .output ? output : input
+    }
+
+    private func update(_ direction: AudioDirection, _ change: (inout DeviceState) -> Void) {
+        if direction == .output { change(&output) } else { change(&input) }
     }
 
     private func refreshDevices() {
-        devices = OutputDevices.all()
+        output.devices = AudioDevices.all(.output)
+        input.devices = AudioDevices.all(.input)
     }
 
-    private func defaultOutputChanged() {
-        defaultOutputID = OutputDevices.defaultOutputID
-        let id = defaultOutputID
-        deviceListeners = [OutputDevices.volumeAddress, OutputDevices.muteAddress].map { address in
+    private func defaultDeviceChanged(_ direction: AudioDirection) {
+        let id = AudioDevices.defaultDeviceID(direction)
+        update(direction) { $0.selectedID = id }
+        deviceListeners[direction] = [AudioDevices.volumeAddress(direction), AudioDevices.muteAddress(direction)].map { address in
             PropertyListener(id, address) { [weak self] in
-                MainActor.assumeIsolated { self?.refreshOutputVolume() }
+                MainActor.assumeIsolated { self?.refreshVolume(direction) }
             }
         }
-        refreshOutputVolume()
-        // Re-route every tap to the new device.
-        syncTaps()
+        refreshVolume(direction)
+        // Re-route every tap to the new output.
+        if direction == .output { syncTaps() }
     }
 
-    private func refreshOutputVolume() {
-        outputVolumeSettable = OutputDevices.canSetVolume(defaultOutputID)
-        outputVolume = Double(OutputDevices.volume(defaultOutputID))
-        outputMuted = OutputDevices.isMuted(defaultOutputID)
+    private func refreshVolume(_ direction: AudioDirection) {
+        let id = state(direction).selectedID
+        update(direction) {
+            $0.volumeSettable = AudioDevices.canSetVolume(id, direction)
+            $0.volume = Double(AudioDevices.volume(id, direction))
+            $0.muted = AudioDevices.isMuted(id, direction)
+        }
     }
 
     // MARK: - Misc

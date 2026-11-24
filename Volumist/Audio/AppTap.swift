@@ -17,10 +17,10 @@ final class AppTap {
     private var ioProcID: AudioDeviceIOProcID?
     private let renderer: TapRenderer
 
-    init(processObjectIDs: [AudioObjectID], outputDevice: OutputDevice, gain: Float) throws {
+    init(processObjectIDs: [AudioObjectID], outputDevice: AudioDevice, gain: Float) throws {
         self.processObjectIDs = processObjectIDs
         self.outputDeviceID = outputDevice.id
-        let stereo = OutputDevices.stereoChannels(outputDevice.id)
+        let stereo = AudioDevices.stereoChannels(outputDevice.id)
         renderer = TapRenderer(gain: gain, left: stereo.left, right: stereo.right)
 
         do {
@@ -38,7 +38,7 @@ final class AppTap {
         renderer.targetGain.store(gain.bitPattern, ordering: .relaxed)
     }
 
-    private func start(outputDevice: OutputDevice) throws {
+    private func start(outputDevice: AudioDevice) throws {
         let description = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
         description.uuid = UUID()
         description.name = "Volumist"
@@ -66,7 +66,7 @@ final class AppTap {
 
         let aggregateDescription: [String: Any] = [
             kAudioAggregateDeviceNameKey: "Volumist Tap",
-            kAudioAggregateDeviceUIDKey: OutputDevices.privateUIDPrefix + UUID().uuidString,
+            kAudioAggregateDeviceUIDKey: AudioDevices.privateUIDPrefix + UUID().uuidString,
             kAudioAggregateDeviceMainSubDeviceKey: outputDevice.uid,
             kAudioAggregateDeviceClockDeviceKey: outputDevice.uid,
             kAudioAggregateDeviceIsPrivateKey: true,

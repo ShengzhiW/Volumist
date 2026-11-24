@@ -18,7 +18,7 @@ enum SelfTest {
         AudioCapturePermission.request { result in note("permission: \(result)"); semaphore.signal() }
         while semaphore.wait(timeout: .now() + 0.05) == .timedOut { RunLoop.main.run(until: .now + 0.05) }
 
-        guard let blackHole = OutputDevices.all().first(where: { $0.name.contains("BlackHole") }) else {
+        guard let blackHole = AudioDevices.all(.output).first(where: { $0.name.contains("BlackHole") }) else {
             note("FAIL: no BlackHole device"); exit(1)
         }
 
@@ -63,7 +63,7 @@ enum SelfTest {
 }
 
 /// A non-muting tap on Volumist's own output: whatever our AppTap plays shows up here.
-private func makeMonitor(on device: OutputDevice, meter: Meter) throws -> (tap: AudioObjectID, aggregate: AudioObjectID, proc: AudioDeviceIOProcID?) {
+private func makeMonitor(on device: AudioDevice, meter: Meter) throws -> (tap: AudioObjectID, aggregate: AudioObjectID, proc: AudioDeviceIOProcID?) {
     var pid = ProcessInfo.processInfo.processIdentifier
     var me = AudioObjectID.unknown
     var address = CA.address(kAudioHardwarePropertyTranslatePIDToProcessObject)
@@ -80,7 +80,7 @@ private func makeMonitor(on device: OutputDevice, meter: Meter) throws -> (tap: 
 
     let aggregate: [String: Any] = [
         kAudioAggregateDeviceNameKey: "Volumist Monitor",
-        kAudioAggregateDeviceUIDKey: OutputDevices.privateUIDPrefix + "monitor." + UUID().uuidString,
+        kAudioAggregateDeviceUIDKey: AudioDevices.privateUIDPrefix + "monitor." + UUID().uuidString,
         kAudioAggregateDeviceMainSubDeviceKey: device.uid,
         kAudioAggregateDeviceIsPrivateKey: true,
         kAudioAggregateDeviceTapAutoStartKey: true,

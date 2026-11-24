@@ -13,6 +13,7 @@ enum AudioProcesses {
     static let runningOutputAddress = CA.address(kAudioProcessPropertyIsRunningOutput)
 
     private static let ownPID = ProcessInfo.processInfo.processIdentifier
+    private static let ownBundleID = Bundle.main.bundleIdentifier ?? "app.volumist.Volumist"
 
     /// Every process that currently has an audio client in coreaudiod.
     static func all() -> [AudioProcess] {
@@ -28,6 +29,12 @@ enum AudioProcesses {
     /// Maps an audio process to the app the user thinks of as playing it — e.g. Safari for
     /// `com.apple.WebKit.GPU`, or Chrome for "Google Chrome Helper".
     static func owningApplication(for process: AudioProcess) -> NSRunningApplication? {
+        // Volumist plays tapped audio itself; never list it (or another copy of it).
+        guard let app = resolveApplication(for: process), app.bundleIdentifier != ownBundleID else { return nil }
+        return app
+    }
+
+    private static func resolveApplication(for process: AudioProcess) -> NSRunningApplication? {
         let direct = NSRunningApplication(processIdentifier: process.pid)
         if let direct, direct.activationPolicy == .regular { return direct }
 

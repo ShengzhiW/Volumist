@@ -4,7 +4,7 @@ A per-app volume mixer that lives in the macOS menu bar, laid out like the syste
 
 - **Sound**: volume for the current output device (follows the volume keys).
 - **Applications**: a slider for each app that's playing audio. Click an app's icon to mute it. Settings are remembered per app.
-- **Output**: switch the default output device.
+- **Output** / **Input**: switch the default output or input device. Each list opens collapsed to the selected device. Click the section header to see the others. Input also has a mic-level slider.
 
 Requires macOS 15+. The first time you change an app's volume, macOS asks for permission to capture audio from other apps (System Settings › Privacy & Security › Screen & System Audio Recording).
 
