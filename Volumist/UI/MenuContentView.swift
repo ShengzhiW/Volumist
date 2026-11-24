@@ -24,7 +24,7 @@ struct MenuContentView: View {
                 .padding(.top, 11)
                 .padding(.bottom, 9)
 
-            DeviceVolumeRow(state: model.output)
+            OutputVolumeRow()
 
             MenuSeparator()
             SectionHeader("Applications")
@@ -48,8 +48,6 @@ struct MenuContentView: View {
 
             MenuSeparator()
             DeviceSection(title: "Input", state: model.input, isExpanded: $inputExpanded)
-            DeviceVolumeRow(state: model.input)
-                .padding(.top, 6)
 
             MenuSeparator()
             MenuActionRow(title: "Sound Settings…") { model.openSoundSettings() }
@@ -81,35 +79,29 @@ enum MenuMetrics {
     static let iconSize: CGFloat = 26
 }
 
-// MARK: - Device volume
+// MARK: - Output volume
 
-private struct DeviceVolumeRow: View {
+private struct OutputVolumeRow: View {
     @EnvironmentObject private var model: MixerModel
-    let state: DeviceState
 
     var body: some View {
-        let isOutput = state.direction == .output
+        let state = model.output
         HStack(spacing: 8) {
-            Image(systemName: isOutput ? "speaker.fill" : "mic.fill")
-                .font(.system(size: isOutput ? 13 : 11))
+            Image(systemName: "speaker.fill")
+                .font(.system(size: 13))
                 .frame(width: 16)
             MenuSlider(
-                value: Binding(get: { state.muted ? 0 : state.volume }, set: { model.setVolume($0, state.direction) }),
+                value: Binding(get: { state.muted ? 0 : state.volume }, set: { model.setVolume($0, .output) }),
                 isEnabled: state.volumeSettable
             )
-            MuteButton(
-                isMuted: state.muted,
-                symbol: isOutput ? "speaker.wave.2.fill" : "mic.fill",
-                mutedSymbol: isOutput ? "speaker.slash.fill" : "mic.slash.fill",
-                label: isOutput ? "Output" : "Input"
-            ) {
-                model.toggleMute(state.direction)
+            MuteButton(isMuted: state.muted, label: "Output") {
+                model.toggleMute(.output)
             }
         }
         .foregroundStyle(.primary.opacity(0.85))
         .padding(.horizontal, MenuMetrics.inset)
         .padding(.bottom, 8)
-        .accessibilityLabel(isOutput ? "Output volume" : "Input volume")
+        .accessibilityLabel("Output volume")
     }
 }
 

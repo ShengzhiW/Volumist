@@ -55,7 +55,7 @@ final class MixerModel: ObservableObject {
 
     private var systemListeners: [PropertyListener] = []
     private var processListeners: [AudioObjectID: PropertyListener] = [:]
-    private var deviceListeners: [AudioDirection: [PropertyListener]] = [:]
+    private var outputVolumeListeners: [PropertyListener] = []
 
     init() {
         if let data = UserDefaults.standard.data(forKey: Self.settingsKey),
@@ -98,7 +98,6 @@ final class MixerModel: ObservableObject {
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
         refreshVolume(.output)
-        refreshVolume(.input)
         refreshApps()
     }
 
@@ -278,14 +277,16 @@ final class MixerModel: ObservableObject {
     private func defaultDeviceChanged(_ direction: AudioDirection) {
         let id = AudioDevices.defaultDeviceID(direction)
         update(direction) { $0.selectedID = id }
-        deviceListeners[direction] = [AudioDevices.volumeAddress(direction), AudioDevices.muteAddress(direction)].map { address in
+        // Only the output has a volume control in the menu.
+        guard direction == .output else { return }
+        outputVolumeListeners = [AudioDevices.volumeAddress(.output), AudioDevices.muteAddress(.output)].map { address in
             PropertyListener(id, address) { [weak self] in
-                MainActor.assumeIsolated { self?.refreshVolume(direction) }
+                MainActor.assumeIsolated { self?.refreshVolume(.output) }
             }
         }
-        refreshVolume(direction)
+        refreshVolume(.output)
         // Re-route every tap to the new output.
-        if direction == .output { syncTaps() }
+        syncTaps()
     }
 
     private func refreshVolume(_ direction: AudioDirection) {
