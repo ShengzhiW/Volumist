@@ -10,7 +10,7 @@ import Foundation
 @MainActor
 final class DriverEngine {
     static let deviceUID = AudioDevices.volumistDeviceUID
-    static let driverPath = "/Library/Audio/Plug-Ins/HAL/VolumistDriver.driver"
+    static let driverPath = DriverInstaller.installedURL.path
 
     static var isInstalled: Bool { FileManager.default.fileExists(atPath: driverPath) }
 

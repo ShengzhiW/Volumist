@@ -128,7 +128,15 @@ Findings that change the plan:
 
 **3. Port features.** Per-app volume and mute through the control block; levels from the driver; drop the audio-capture permission UI on this path.
 
+*Phase 3 status:* done as part of phase 2. Per-app volume and mute are driver rules, levels come from the driver, and the capture-permission UI is skipped while the driver is in use.
+
 **4. Installer.** Package, Settings status and install/uninstall, restarting `coreaudiod`.
+
+*Phase 4 status (2026-11-24): done.* A build phase ("Embed Volumist Driver") compiles the driver into `Volumist.app/Contents/Resources`. Settings › General › Audio Engine shows the driver's status (not installed, installed, or update available when the bundled build differs) and installs, updates or uninstalls it through `do shell script … with administrator privileges` (`DriverInstaller.swift`). Fixed paths are shell-quoted; the copy is owned by root:wheel; the spike driver is removed; Core Audio restarts afterwards. Before a change the app gives the default output back; afterwards it rebuilds everything when Core Audio reports `kAudioHardwarePropertyServiceRestarted` (devices, listeners, taps and engine), with a timed fallback if the notification is missed.
+
+Verified on this Mac: Uninstall then Install from Settings both worked with the password prompt. The installed driver is byte-identical to the bundled one, and the running app (same process throughout) came back to driver mode with Volumist as the default output after both Core Audio restarts.
+
+Found while testing and fixed: **a second copy of Volumist broke the first's routing.** It replaced the shared memory, and when it exited the device vanished while the first copy still thought the driver was running. The app now exits at launch if another copy (same bundle ID, debug or installed) is already running.
 
 **5. Hardening.** Sample-rate and device changes, Bluetooth and AirPlay, sleep and wake, crash recovery, apps that pick a specific device.
 

@@ -7,9 +7,16 @@ A per-app volume mixer that lives in the macOS menu bar, laid out like the syste
 - **Output** / **Input**: switch the default output or input device. Click a section header to show every device or just the selected one; Volumist remembers which.
 - **Settings** (from the menu): hide apps or output and input devices from the menu, make the main and per-app sliders snap to 5, 10 or 20% steps, show or hide the Output and Input sections, and turn on Open at Login.
 
-Requires macOS 15+. The first time you change an app's volume, macOS asks for permission to capture audio from other apps (System Settings › Privacy & Security › Screen & System Audio Recording).
+Requires macOS 15+.
 
-## How it works
+## Audio engine
+
+Volumist changes app volumes in one of two ways (Settings › General › Audio Engine):
+
+- **Volumist audio driver** (recommended). Install it from that Settings screen, which asks for an administrator password and briefly restarts Core Audio. Volumist's "Volumist" output device then becomes the default output, each app's volume is applied as its audio passes through, and the mix plays to your chosen device. No recording permission and no recording indicator. See [docs/driver-architecture.md](docs/driver-architecture.md).
+- **Audio capture** (used when the driver isn't installed). Core Audio process taps capture each adjusted app and play it back at the chosen volume. It needs the System Audio Recording permission and shows the purple recording indicator while active.
+
+## How audio capture works
 
 Each adjusted app gets a Core Audio **process tap** (`CATapDescription`, muted-when-tapped) and a private aggregate device made of the tap plus the current output device. An IOProc copies the tapped audio to the output with a gain ramp (`Volumist/Audio/AppTap.swift`). If Volumist quits, the taps go away and apps play at full volume again.
 

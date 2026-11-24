@@ -86,6 +86,10 @@ final class MixerModel: ObservableObject {
     private var workspaceObservers: [NSObjectProtocol] = []
     /// The real output the driver's mix plays to, and whether the engine was running (so a
     /// relaunch after a crash can go back to it instead of macOS's fallback device).
+    @Published private(set) var driverStatus = DriverInstaller.status
+    @Published private(set) var driverBusy = false
+    @Published private(set) var driverError: String?
+    private var awaitingAudioRestart = false
     private static let realOutputKey = "driverRealOutputUID"
     private static let engineActiveKey = "driverEngineActive"
 
@@ -121,6 +125,22 @@ final class MixerModel: ObservableObject {
         permission = AudioCapturePermission.current
         nowPlaying.onChange = { [weak self] in self?.applyNowPlaying() }
 
+        installSystemListeners()
+
+        // A newly launched app gets its saved volume before it makes a sound.
+        workspaceObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.publishRules() }
+        })
+
+        refreshDevices()
+        defaultDeviceChanged(.output)
+        defaultDeviceChanged(.input)
+        configureEngine()
+    }
+
+    private func installSystemListeners() {
         systemListeners = [
             PropertyListener(.system, AudioProcesses.listAddress) { [weak self] in
                 MainActor.assumeIsolated { self?.scheduleRefresh() }
@@ -134,19 +154,10 @@ final class MixerModel: ObservableObject {
             PropertyListener(.system, CA.address(kAudioHardwarePropertyDefaultInputDevice)) { [weak self] in
                 MainActor.assumeIsolated { self?.defaultDeviceChanged(.input) }
             },
+            PropertyListener(.system, CA.address(kAudioHardwarePropertyServiceRestarted)) { [weak self] in
+                MainActor.assumeIsolated { self?.audioServiceRestarted() }
+            },
         ]
-
-        // A newly launched app gets its saved volume before it makes a sound.
-        workspaceObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.publishRules() }
-        })
-
-        refreshDevices()
-        defaultDeviceChanged(.output)
-        defaultDeviceChanged(.input)
-        configureEngine()
     }
 
     func shutdown() {
@@ -659,6 +670,79 @@ final class MixerModel: ObservableObject {
         UserDefaults.standard.set(false, forKey: Self.engineActiveKey)
         stoppingDriver = false
         defaultDeviceChanged(.output)
+    }
+
+    // MARK: - Installing the driver
+
+    func refreshDriverStatus() {
+        driverStatus = DriverInstaller.status
+    }
+
+    func installDriver() {
+        changeDriver { DriverInstaller.install(completion: $0) }
+    }
+
+    func uninstallDriver() {
+        changeDriver { DriverInstaller.uninstall(completion: $0) }
+    }
+
+    private func changeDriver(_ run: (@escaping @MainActor (Result<Void, DriverInstaller.Failure>) -> Void) -> Void) {
+        guard !driverBusy else { return }
+        driverBusy = true
+        driverError = nil
+        // Give the default output back to the real device before Core Audio restarts.
+        stopDriver()
+        awaitingAudioRestart = true
+        run { [weak self] result in
+            guard let self else { return }
+            self.driverBusy = false
+            switch result {
+            case .success:
+                // Core Audio is restarting; audioServiceRestarted() rebuilds everything. In case
+                // that notification never arrives, rebuild anyway after a few seconds.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                    if self?.awaitingAudioRestart == true { self?.audioServiceRestarted() }
+                }
+            case .failure(let failure):
+                self.awaitingAudioRestart = false
+                switch failure {
+                case .cancelled: break
+                case .notBundled: self.driverError = "This copy of Volumist doesn't include the driver."
+                case .failed(let message): self.driverError = message
+                }
+                self.configureEngine()
+            }
+            self.refreshDriverStatus()
+        }
+    }
+
+    /// Core Audio restarted (driver installed or removed, or it crashed): every device and process
+    /// object is new, so drop everything that refers to the old ones and set up again.
+    private func audioServiceRestarted() {
+        awaitingAudioRestart = false
+        log.info("Core Audio restarted; rebuilding")
+        if let driver {
+            // Not stopDriver(): the old devices are gone, and keeping the "engine active" flag
+            // makes the restart go back to the saved real output.
+            driverTimer?.invalidate()
+            driverTimer = nil
+            driver.shutdown()
+            self.driver = nil
+            usingDriver = false
+        }
+        taps.values.forEach { $0.invalidate() }
+        taps.removeAll()
+        levelMonitor?.invalidate()
+        levelMonitor = nil
+        monitoredProcesses = [:]
+        processListeners = [:]
+        outputVolumeListeners = []
+        installSystemListeners()
+        refreshDevices()
+        defaultDeviceChanged(.output)
+        defaultDeviceChanged(.input)
+        refreshDriverStatus()
+        configureEngine()
     }
 
     private func initialRealOutput() -> AudioDevice? {

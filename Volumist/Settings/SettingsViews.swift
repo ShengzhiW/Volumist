@@ -120,6 +120,12 @@ struct GeneralSettingsView: View {
     @AppStorage(Preferences.showOutputSection) private var showOutputSection = true
     @AppStorage(Preferences.showInputSection) private var showInputSection = true
     @AppStorage(Preferences.audioEngine) private var audioEngine = Preferences.engineDriver
+    @State private var confirming: DriverAction?
+
+    private enum DriverAction: Identifiable {
+        case install, update, uninstall
+        var id: Self { self }
+    }
 
     var body: some View {
         Form {
@@ -129,6 +135,22 @@ struct GeneralSettingsView: View {
                     Text("Audio capture").tag(Preferences.engineCapture)
                 }
                 .onChange(of: audioEngine) { model.configureEngine() }
+                LabeledContent("Volumist audio driver") {
+                    HStack(spacing: 8) {
+                        if model.driverBusy { ProgressView().controlSize(.small) }
+                        Text(driverStatusText).foregroundStyle(.secondary)
+                        if let action = driverAction {
+                            Button(actionTitle(action)) { confirming = action }
+                                .disabled(model.driverBusy)
+                        }
+                    }
+                }
+                if let error = model.driverError {
+                    Text(error)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } header: {
                 Text("Audio Engine")
             } footer: {
@@ -154,7 +176,69 @@ struct GeneralSettingsView: View {
         .formStyle(.grouped)
         .frame(width: 480)
         .fixedSize(horizontal: false, vertical: true)
-        .onAppear { model.refreshLaunchAtLogin() }
+        .onAppear {
+            model.refreshLaunchAtLogin()
+            model.refreshDriverStatus()
+        }
+        .alert(item: $confirming) { action in
+            Alert(
+                title: Text(alertTitle(action)),
+                message: Text(alertMessage(action)),
+                primaryButton: action == .uninstall
+                    ? .destructive(Text(actionTitle(action).replacingOccurrences(of: "…", with: ""))) { perform(action) }
+                    : .default(Text(actionTitle(action).replacingOccurrences(of: "…", with: ""))) { perform(action) },
+                secondaryButton: .cancel()
+            )
+        }
+    }
+
+    private var driverStatusText: String {
+        if model.driverBusy { return "Working…" }
+        switch model.driverStatus {
+        case .notInstalled: return "Not installed"
+        case .installed(let version): return "Installed (\(version))"
+        case .updateAvailable(let installed, _): return "Update available (installed \(installed))"
+        case .notBundled: return "Not available in this build"
+        }
+    }
+
+    private var driverAction: DriverAction? {
+        switch model.driverStatus {
+        case .notInstalled: return .install
+        case .updateAvailable: return .update
+        case .installed: return .uninstall
+        case .notBundled: return nil
+        }
+    }
+
+    private func actionTitle(_ action: DriverAction) -> String {
+        switch action {
+        case .install: return "Install…"
+        case .update: return "Update…"
+        case .uninstall: return "Uninstall…"
+        }
+    }
+
+    private func alertTitle(_ action: DriverAction) -> String {
+        switch action {
+        case .install: return "Install the Volumist audio driver?"
+        case .update: return "Update the Volumist audio driver?"
+        case .uninstall: return "Remove the Volumist audio driver?"
+        }
+    }
+
+    private func alertMessage(_ action: DriverAction) -> String {
+        let restart = "macOS will ask for an administrator password. Core Audio then restarts, so all sound stops for a moment."
+        switch action {
+        case .install, .update:
+            return "With the driver, Volumist changes each app's volume without recording audio: no permission prompt and no recording indicator. " + restart
+        case .uninstall:
+            return restart + " Volumist then uses audio capture, which needs the System Audio Recording permission and shows the recording indicator."
+        }
+    }
+
+    private func perform(_ action: DriverAction) {
+        if action == .uninstall { model.uninstallDriver() } else { model.installDriver() }
     }
 
     private var engineStatus: String {
