@@ -17,11 +17,16 @@ Helper processes are grouped under the app the user sees (e.g. `com.apple.WebKit
 ## Build
 
 ```bash
-xcodebuild -project Volumist.xcodeproj -scheme Volumist -configuration Release -derivedDataPath build/DerivedData build
-open build/DerivedData/Build/Products/Release/Volumist.app
+./scripts/build-app.sh
 ```
 
-Or open `Volumist.xcodeproj` in Xcode and run. Builds are ad-hoc signed, so macOS may ask for the audio-capture permission again after a rebuild.
+This builds a universal Release app at `dist/Volumist.app`, which you can drag into Applications. Add `--install` to copy it there for you:
+
+```bash
+./scripts/build-app.sh --install
+```
+
+Or open `Volumist.xcodeproj` in Xcode and run. Builds are ad-hoc signed (no Developer ID), so they run on the Mac that built them. Another Mac's Gatekeeper will block them. macOS may also ask for the audio-capture permission again after a rebuild.
 
 ### Self-test (Debug builds)
 
