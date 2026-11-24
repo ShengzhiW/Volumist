@@ -1,6 +1,7 @@
-// In-process tests for the Volumist driver. Loads the built driver bundle and plays both the
-// Core Audio host (calling the plug-in interface, recording notifications) and Volumist.app
-// (creating the shared memory, keeping the heartbeat, publishing gain rules).
+// In-process tests for the Volumist driver. Loads a test build of the driver (VD_TESTING: its own
+// socket, and it accepts this program instead of Volumist) and plays the Core Audio host (calling
+// the plug-in interface, recording notifications). The app's side is the real app engine
+// (VolumistEngine.c), which serves the shared memory over the socket and keeps the heartbeat.
 //
 //   DriverTests <path to VolumistDriver.driver>
 
@@ -20,6 +21,9 @@
 #include <unistd.h>
 
 #include "../VolumistDriverProtocol.h"
+#include "../../Volumist/Engine/VolumistEngine.h"
+#include <sys/socket.h>
+#include <sys/un.h>
 
 extern char **environ;
 
@@ -122,33 +126,11 @@ static int WaitFor(int (*condition)(void), int timeoutMs) {
     return condition();
 }
 
-// MARK: - Fake app
+// MARK: - The app (the real engine)
 
+#define kTestSocket "/tmp/volumist.drivertest.sock"
+static VEEngine *gEngine;
 static VDShared *gShared;
-static _Atomic int gBeating;
-
-static void *Heartbeat(void *unused) {
-    (void)unused;
-    for (;;) {
-        if (gBeating && gShared) vd_store64(&gShared->heartbeatNanos, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
-        usleep(100 * 1000);
-    }
-    return NULL;
-}
-
-static VDShared *CreateSharedMemory(void) {
-    shm_unlink(VD_SHM_NAME);
-    int fd = shm_open(VD_SHM_NAME, O_CREAT | O_RDWR, 0600);
-    if (fd < 0 || ftruncate(fd, sizeof(VDShared)) != 0) { perror("shm"); exit(1); }
-    VDShared *shared = mmap(NULL, sizeof(VDShared), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    memset(shared, 0, sizeof(VDShared));
-    shared->hostPID = (uint32_t)getpid();
-    shared->version = VD_VERSION;
-    vd_store64(&shared->heartbeatNanos, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
-    shared->magic = VD_MAGIC;
-    return shared;
-}
 
 static void SetRule(int index, uint32_t pid, const char *bundle, float gain) {
     VDRule *rule = &gShared->rules[index];
@@ -161,6 +143,7 @@ static void SetRule(int index, uint32_t pid, const char *bundle, float gain) {
 
 static int DeviceVisible(void) { return DeviceListCount() == 1; }
 static int DeviceHidden(void) { return DeviceListCount() == 0; }
+static int Replied(void) { return ve_driver_reply(gEngine) >= 0; }
 static int RateRequested(void) { return gRequestedAction != 0; }
 static int VolumeIs07(void) { Float32 v = 0; GetData(kVolume, kAudioLevelControlPropertyScalarValue, sizeof(v), &v); return fabsf(v - 0.7f) < 1e-6f; }
 static int MuteIsOn(void) { UInt32 m = 0; GetData(kMute, kAudioBooleanControlPropertyValue, sizeof(m), &m); return m == 1; }
@@ -178,7 +161,7 @@ int main(int argc, char **argv) {
     void *(*create)(CFAllocatorRef, CFUUIDRef) = (void *(*)(CFAllocatorRef, CFUUIDRef))dlsym(handle, "VolumistDriver_Create");
     if (!create) { fprintf(stderr, "factory not exported\n"); return 1; }
     gDriver = create(NULL, kAudioServerPlugInTypeUUID);
-    shm_unlink(VD_SHM_NAME);
+    uint32_t (*checkApp)(pid_t) = (uint32_t (*)(pid_t))dlsym(handle, "VolumistDriver_TestCheckApp");
 
     printf("Lifecycle\n");
     CHECK(gDriver != NULL, "factory returns the driver for the AudioServerPlugIn type");
@@ -187,13 +170,40 @@ int main(int argc, char **argv) {
     usleep(300 * 1000);
     CHECK(DeviceListCount() == 0, "no device while the app isn't running");
 
+    printf("Who may connect\n");
+    CHECK(checkApp != NULL && checkApp(getpid()) == VD_REPLY_ATTACHED, "driver accepts a validly signed app with the right identifier");
+    CHECK(checkApp != NULL && checkApp(1) == VD_REPLY_NOT_APP, "driver rejects another program (launchd)");
+    {
+        // An engine that only serves Core Audio's account must not hand the memory to us.
+        VEEngine *strict = ve_create("/tmp/volumist.uidtest.sock", 202);
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un address = {0};
+        address.sun_family = AF_UNIX;
+        strlcpy(address.sun_path, "/tmp/volumist.uidtest.sock", sizeof(address.sun_path));
+        int connected = connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0;
+        struct timeval timeout = {2, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        char buffer[64];
+        union { struct cmsghdr header; char space[CMSG_SPACE(sizeof(int))]; } control;
+        struct iovec iov = {buffer, sizeof(buffer)};
+        struct msghdr message = {0};
+        message.msg_iov = &iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.space;
+        message.msg_controllen = sizeof(control.space);
+        ssize_t got = connected ? recvmsg(fd, &message, 0) : -1;
+        CHECK(connected && got == 0 && message.msg_controllen == 0, "engine closes connections from other accounts without sending the memory");
+        close(fd);
+        ve_destroy(strict);
+    }
+
     printf("App appears\n");
-    gShared = CreateSharedMemory();
+    gEngine = ve_create(kTestSocket, (int)getuid());
+    CHECK(gEngine != NULL, "app engine starts and listens");
+    gShared = ve_shared_for_test(gEngine);
     SetRule(0, 0, "com.example.player", 0.25f);  // published before the player connects
-    pthread_t beat;
-    gBeating = 1;
-    pthread_create(&beat, NULL, Heartbeat, NULL);
-    CHECK(WaitFor(DeviceVisible, 1000), "device appears once the app's shared memory and heartbeat exist");
+    CHECK(WaitFor(DeviceVisible, 1000), "device appears once the driver has received the app's memory");
+    CHECK(WaitFor(Replied, 500) && ve_driver_reply(gEngine) == VD_REPLY_ATTACHED, "driver tells the app it attached");
     CHECK(gDeviceListChanges >= 1, "host notified that the device list changed (%d)", (int)gDeviceListChanges);
     CHECK(vd_load32(&gShared->deviceVisible) == 1 && vd_load32(&gShared->attachCount) == 1, "driver reports itself attached and visible");
     CHECK(vd_load32(&gShared->driverPID) == (uint32_t)getpid(), "driver reports its PID");
@@ -279,8 +289,13 @@ int main(int argc, char **argv) {
     CHECK(rate == 96000 && format.mSampleRate == 96000, "device and stream now at %.0f / %.0f Hz", rate, format.mSampleRate);
     CHECK(vd_load32(&gShared->sampleRate) == 96000, "driver reports 96 kHz to the app");
     gRequestedAction = 0;
-    Float64 unsupported = 22050;
+    Float64 unsupported = 12000;
     CHECK(SetData(kDevice, kAudioDevicePropertyNominalSampleRate, sizeof(unsupported), &unsupported) != 0, "unsupported rate rejected");
+    Float64 headset = 24000;
+    CHECK(SetData(kDevice, kAudioDevicePropertyNominalSampleRate, sizeof(headset), &headset) == 0 && gRequestedAction == 24000,
+          "Bluetooth headset rate (24 kHz) accepted");
+    gRequestedAction = 0;
+    (*gDriver)->AbortDeviceConfigurationChange(gDriver, kDevice, 24000, NULL);
 
     printf("Volume and mute\n");
     uint32_t seq = vd_load32(&gShared->volumeSeq);
@@ -314,26 +329,31 @@ int main(int argc, char **argv) {
 
     printf("App goes away\n");
     int before = gDeviceListChanges;
-    gBeating = 0;  // as if the app hung or crashed
+    ve_pause_heartbeat_for_test(gEngine, true);  // as if the app hung
     CHECK(!DeviceHidden(), "device still present right after the heartbeat stops");
     CHECK(WaitFor(DeviceHidden, 2500), "device disappears within ~1.5 s of the last heartbeat");
     CHECK(gDeviceListChanges > before, "host notified that the device is gone");
     // Detached: no shared memory, so no rules apply. The real HAL stops IO once the device is gone,
     // but a cycle already in flight must still be safe and leave audio unchanged.
     CHECK(Near(ProcessOutput(7, 0.5f, NULL), 0.5f), "an IO cycle after detaching is safe and applies no rules");
-    gBeating = 1;
-    CHECK(WaitFor(DeviceVisible, 1500), "device returns when the heartbeat resumes");
-    CHECK(vd_load32(&gShared->attachCount) == 2, "driver re-attached (attach count %u)", vd_load32(&gShared->attachCount));
+    ve_pause_heartbeat_for_test(gEngine, false);
+    CHECK(WaitFor(DeviceVisible, 3500), "device returns when the heartbeat resumes (the driver reconnects)");
+    CHECK(vd_load32(&gShared->attachCount) == 2, "driver re-attached once, without churning while the app was stalled (attach count %u)", vd_load32(&gShared->attachCount));
 
     // A dead app PID hides the device even if the heartbeat looks fresh.
     pid_t gone = 0;
     char *trueArgs[] = {"/usr/bin/true", NULL};
     posix_spawn(&gone, "/usr/bin/true", NULL, NULL, trueArgs, environ);
     waitpid(gone, NULL, 0);
+    uint32_t realHost = gShared->hostPID;
     gShared->hostPID = (uint32_t)gone;
     CHECK(WaitFor(DeviceHidden, 1500), "device disappears when the app's process is gone");
+    gShared->hostPID = realHost;
+    CHECK(WaitFor(DeviceVisible, 3500), "device returns once the app is alive again");
 
-    shm_unlink(VD_SHM_NAME);
+    printf("App quits\n");
+    ve_destroy(gEngine);
+    CHECK(WaitFor(DeviceHidden, 600), "device disappears at once when the app closes its connection");
     printf("\n%d checks, %d failed\n", gChecks, gFailures);
     return gFailures ? 1 : 0;
 }

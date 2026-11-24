@@ -1,14 +1,19 @@
 #include "VolumistEngine.h"
 
 #include <AudioToolbox/AudioServices.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <poll.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -26,9 +31,16 @@
 #define kIdleCallbacks 4
 
 struct VEEngine {
-    char name[32];
+    char socketPath[104];
+    uid_t peerUID;
     VDShared *shared;
+    int memoryFD;            // the unnamed shared memory, handed to the driver
+    int listenFD;
+    int clientFD;            // the driver's connection (server thread only)
+    _Atomic int driverReply;
+    _Atomic bool heartbeatPaused;
     pthread_t heartbeatThread;
+    pthread_t serverThread;
     _Atomic bool stopping;
     pthread_mutex_t mutex;
 
@@ -74,7 +86,9 @@ static void *Heartbeat(void *context) {
     VEEngine *engine = context;
     pthread_setname_np("Volumist engine heartbeat");
     while (!atomic_load(&engine->stopping)) {
-        vd_store64(&engine->shared->heartbeatNanos, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+        if (!atomic_load(&engine->heartbeatPaused)) {
+            vd_store64(&engine->shared->heartbeatNanos, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+        }
         pthread_mutex_lock(&engine->mutex);
         AudioObjectID device = engine->device;
         pthread_mutex_unlock(&engine->mutex);
@@ -91,38 +105,159 @@ static void *Heartbeat(void *context) {
     return NULL;
 }
 
-VEEngine *ve_create(const char *name) {
+// MARK: - Handing the memory to the driver
+
+/// Sends the handshake with the memory's descriptor attached.
+static bool SendMemory(int fd, int memoryFD) {
+    VDHandshake handshake = {VD_MAGIC, VD_VERSION, sizeof(VDShared)};
+    struct iovec iov = {&handshake, sizeof(handshake)};
+    union { struct cmsghdr header; char space[CMSG_SPACE(sizeof(int))]; } control;
+    memset(&control, 0, sizeof(control));
+    struct msghdr message = {0};
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.space;
+    message.msg_controllen = sizeof(control.space);
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&message);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &memoryFD, sizeof(int));
+    return sendmsg(fd, &message, 0) == sizeof(handshake);
+}
+
+static void HandleConnection(VEEngine *engine, int fd) {
+    // Only Core Audio's account gets the memory: nothing else can read the mix or change gains.
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid(fd, &uid, &gid) != 0 || uid != engine->peerUID) {
+        close(fd);
+        return;
+    }
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+    struct timeval timeout = {2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (!SendMemory(fd, engine->memoryFD)) {
+        close(fd);
+        return;
+    }
+    VDReply reply = {0};
+    if (recv(fd, &reply, sizeof(reply), MSG_WAITALL) == sizeof(reply) && reply.magic == VD_MAGIC) {
+        atomic_store(&engine->driverReply, (int)reply.status);
+    }
+    if (reply.magic != VD_MAGIC || reply.status != VD_REPLY_ATTACHED) {
+        close(fd);
+        return;
+    }
+    // Keep the connection: when it closes (we quit or crash), the driver removes the device at once.
+    if (engine->clientFD >= 0) close(engine->clientFD);
+    engine->clientFD = fd;
+}
+
+static void *Server(void *context) {
+    VEEngine *engine = context;
+    pthread_setname_np("Volumist engine server");
+    while (!atomic_load(&engine->stopping)) {
+        struct pollfd fds[2] = {{engine->listenFD, POLLIN, 0}, {engine->clientFD, POLLIN, 0}};
+        int count = engine->clientFD >= 0 ? 2 : 1;
+        if (poll(fds, (nfds_t)count, 250) <= 0) continue;
+        if (count == 2 && (fds[1].revents & (POLLHUP | POLLERR | POLLIN))) {
+            char byte;
+            if (recv(engine->clientFD, &byte, 1, MSG_DONTWAIT) <= 0 && errno != EAGAIN) {
+                close(engine->clientFD);  // the driver went away (Core Audio restarted)
+                engine->clientFD = -1;
+            }
+        }
+        if (fds[0].revents & POLLIN) {
+            int fd = accept(engine->listenFD, NULL, NULL);
+            if (fd >= 0) HandleConnection(engine, fd);
+        }
+    }
+    return NULL;
+}
+
+static int CreateMemory(VDShared **outShared) {
+    // Create, then unlink at once: the only way in is the descriptor we hand to the driver.
+    char name[32];
+    for (int attempt = 0; attempt < 8; attempt++) {
+        snprintf(name, sizeof(name), "/avm.%d.%08x", getpid(), arc4random());
+        int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd < 0) continue;
+        shm_unlink(name);
+        void *mapped = MAP_FAILED;
+        if (ftruncate(fd, sizeof(VDShared)) == 0) {
+            mapped = mmap(NULL, sizeof(VDShared), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        }
+        if (mapped == MAP_FAILED) {
+            close(fd);
+            return -1;
+        }
+        *outShared = mapped;
+        return fd;
+    }
+    return -1;
+}
+
+static int Listen(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, path, sizeof(address.sun_path));
+    unlink(path);  // a crashed run may have left one behind
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(fd, 4) != 0) {
+        close(fd);
+        return -1;
+    }
+    chmod(path, 0666);  // so _coreaudiod can connect; what it gets is checked in HandleConnection
+    return fd;
+}
+
+VEEngine *ve_create(const char *socketPath, int peerUID) {
     VEEngine *engine = calloc(1, sizeof(VEEngine));
     if (!engine) return NULL;
-    strlcpy(engine->name, name ? name : VD_SHM_NAME, sizeof(engine->name));
+    strlcpy(engine->socketPath, socketPath ? socketPath : VD_SOCKET_PATH, sizeof(engine->socketPath));
+    if (peerUID < 0) {
+        struct passwd *coreaudio = getpwnam("_coreaudiod");
+        engine->peerUID = coreaudio ? coreaudio->pw_uid : 202;
+    } else {
+        engine->peerUID = (uid_t)peerUID;
+    }
     pthread_mutex_init(&engine->mutex, NULL);
     engine->ratio = 1;
     engine->pushedVolume = -1;
     engine->pushedMute = -1;
+    engine->clientFD = -1;
+    atomic_store(&engine->driverReply, -1);
     atomic_store(&engine->leftChannel, 0);
     atomic_store(&engine->rightChannel, 1);
     atomic_store(&engine->ratioBits, DoubleBits(1));
 
-    shm_unlink(engine->name);  // a crashed run may have left one behind
-    int fd = shm_open(engine->name, O_CREAT | O_RDWR, 0666);
-    if (fd < 0) { free(engine); return NULL; }
-    // The driver runs as _coreaudiod, so the region must be world-accessible. (The plan tracks
-    // replacing this with a descriptor handed over a verified connection.)
-    fchmod(fd, 0666);
-    if (ftruncate(fd, sizeof(VDShared)) != 0) { close(fd); shm_unlink(engine->name); free(engine); return NULL; }
-    void *mapped = mmap(NULL, sizeof(VDShared), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (mapped == MAP_FAILED) { shm_unlink(engine->name); free(engine); return NULL; }
-    engine->shared = mapped;
+    engine->memoryFD = CreateMemory(&engine->shared);
+    if (engine->memoryFD < 0) { free(engine); return NULL; }
     memset(engine->shared, 0, sizeof(VDShared));
     engine->shared->hostPID = (uint32_t)getpid();
     engine->shared->version = VD_VERSION;
     vd_store64(&engine->shared->heartbeatNanos, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     vd_store32(&engine->shared->magic, VD_MAGIC);  // published last
 
-    if (pthread_create(&engine->heartbeatThread, NULL, Heartbeat, engine) != 0) {
+    engine->listenFD = Listen(engine->socketPath);
+    if (engine->listenFD < 0 ||
+        pthread_create(&engine->heartbeatThread, NULL, Heartbeat, engine) != 0) {
+        if (engine->listenFD >= 0) close(engine->listenFD);
         munmap(engine->shared, sizeof(VDShared));
-        shm_unlink(engine->name);
+        close(engine->memoryFD);
+        free(engine);
+        return NULL;
+    }
+    if (pthread_create(&engine->serverThread, NULL, Server, engine) != 0) {
+        atomic_store(&engine->stopping, true);
+        pthread_join(engine->heartbeatThread, NULL);
+        close(engine->listenFD);
+        unlink(engine->socketPath);
+        munmap(engine->shared, sizeof(VDShared));
+        close(engine->memoryFD);
         free(engine);
         return NULL;
     }
@@ -133,12 +268,19 @@ void ve_destroy(VEEngine *engine) {
     if (!engine) return;
     atomic_store(&engine->stopping, true);
     pthread_join(engine->heartbeatThread, NULL);
+    pthread_join(engine->serverThread, NULL);
     ve_stop_output(engine);
-    shm_unlink(engine->name);
+    close(engine->listenFD);
+    unlink(engine->socketPath);
+    if (engine->clientFD >= 0) close(engine->clientFD);  // the driver removes the device now
     munmap(engine->shared, sizeof(VDShared));
+    close(engine->memoryFD);
     pthread_mutex_destroy(&engine->mutex);
     free(engine);
 }
+
+int ve_driver_reply(VEEngine *engine) { return atomic_load(&engine->driverReply); }
+void ve_pause_heartbeat_for_test(VEEngine *engine, bool paused) { atomic_store(&engine->heartbeatPaused, paused); }
 
 // MARK: - Output
 

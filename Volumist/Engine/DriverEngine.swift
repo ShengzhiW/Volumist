@@ -31,7 +31,7 @@ final class DriverEngine {
     private var activity: NSObjectProtocol?
 
     init?() {
-        guard let engine = ve_create(nil) else { return nil }
+        guard let engine = ve_create(nil, -1) else { return nil }
         self.engine = engine
         // The heartbeat must keep ticking or the device disappears: keep App Nap away.
         activity = ProcessInfo.processInfo.beginActivity(
@@ -58,6 +58,13 @@ final class DriverEngine {
     }
 
     var isDeviceVisible: Bool { engine.map { ve_device_visible($0) } ?? false }
+
+    /// The driver's answer to the handover (VD_REPLY_*), or nil if no driver has connected.
+    var driverReply: Int32? {
+        guard let engine else { return nil }
+        let reply = ve_driver_reply(engine)
+        return reply < 0 ? nil : reply
+    }
 
     struct Rule {
         var pid: pid_t = 0

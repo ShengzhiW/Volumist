@@ -18,9 +18,15 @@ codesign --force --sign - $DRIVER 2>/dev/null
 echo "Built $PWD/$DRIVER"
 
 if [[ "${1:-}" == "--test" ]]; then
-  clang -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -mmacosx-version-min=15.0 \
-    -framework CoreAudio -framework CoreFoundation -o $OUT/DriverTests Tests/DriverTests.c
-  ./$OUT/DriverTests $DRIVER
+  # Test build of the driver: own socket, and it accepts the test program instead of Volumist.
+  TESTING=$OUT/VolumistDriverTesting.driver
+  rm -rf $TESTING && mkdir -p $TESTING/Contents/MacOS && cp Info.plist $TESTING/Contents/Info.plist
+  clang -bundle -O2 -Wall -Wextra -Werror -DVD_TESTING -mmacosx-version-min=15.0 -fvisibility=hidden \
+    -framework CoreAudio -framework CoreFoundation -o $TESTING/Contents/MacOS/VolumistDriver VolumistDriver.c
+  clang -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -mmacosx-version-min=15.0 -I. \
+    -framework CoreAudio -framework AudioToolbox -framework CoreFoundation \
+    -o $OUT/DriverTests Tests/DriverTests.c ../Volumist/Engine/VolumistEngine.c
+  ./$OUT/DriverTests $TESTING
   clang -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -mmacosx-version-min=15.0 -I. \
     -framework CoreAudio -framework AudioToolbox -framework CoreFoundation \
     -o $OUT/EngineTests Tests/EngineTests.c ../Volumist/Engine/VolumistEngine.c

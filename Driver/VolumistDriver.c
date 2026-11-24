@@ -5,8 +5,13 @@
 // owner app or its bundle ID; WriteMix copies the mix into shared memory, from which the app
 // plays it to the real output device.
 //
-// The device is published only while the app is alive (fresh heartbeat in shared memory), so if
-// the app quits or crashes the device disappears and macOS switches back to the real output.
+// The device is published only while the app is connected and alive (open socket, fresh heartbeat
+// in shared memory), so if the app quits or crashes the device disappears and macOS switches back
+// to the real output.
+//
+// Security: the app's shared memory has no name. The driver connects to the app's socket, checks
+// through the kernel (csops) that the peer is a validly signed Volumist, and receives the memory's
+// descriptor; the app only hands it to Core Audio's account. Nothing else can read the mix.
 //
 // Threads: the HAL calls property and lifecycle functions on its own threads and IO functions on
 // a real-time thread. Non-real-time state is guarded by gMutex; the IO path uses atomics only.
@@ -23,11 +28,14 @@
 #include <math.h>
 #include <os/log.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -51,7 +59,19 @@ enum {
 #define kMinDecibels -64.0f
 #define kMaxGain 4.0f
 
-static const Float64 kSupportedRates[] = {44100, 48000, 88200, 96000, 176400, 192000};
+// Includes the low rates Bluetooth headsets use in hands-free mode, so the driver can follow them.
+static const Float64 kSupportedRates[] = {8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000, 176400, 192000};
+
+// What the driver connects to and who it accepts. Test builds use their own socket and accept the
+// test program instead of Volumist.
+#ifdef VD_TESTING
+#define kSocketPath "/tmp/volumist.drivertest.sock"
+#define kRequiredIdentifier "DriverTests"
+#else
+#define kSocketPath VD_SOCKET_PATH
+#define kRequiredIdentifier VD_APP_IDENTIFIER
+#endif
+#define kRetryAfterFailureNs 2000000000ull
 #define kSupportedRateCount (sizeof(kSupportedRates) / sizeof(kSupportedRates[0]))
 
 static os_log_t gLog;
@@ -79,6 +99,8 @@ static uint32_t gLastMuteRequestSeq;
 // in gRetired and unmapped later, once no IO can still be using it.
 static _Atomic(VDShared *) gShared;
 static VDShared *gRetired;
+static int gSocket = -1;               // connection to the app while attached
+static uint64_t gNextAttemptNanos;     // back off after a failed or rejected handover
 static _Atomic bool gDeviceVisible;
 static bool gOwnerLookupWorks;
 
@@ -228,33 +250,126 @@ static void RequestRateChange(Float64 rate) {
 
 // MARK: - Shared memory lifecycle
 
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+#define kCSOpsStatus 0
+#define kCSOpsIdentity 11
+#define kCSOpsTeamID 14
+#define kCSValid 0x00000001u
+
+/// Is `pid` a validly signed Volumist? Asks the kernel, which holds the code signature of every
+/// running process, so no files need to be read.
+static uint32_t CheckApp(pid_t pid) {
+    uint32_t flags = 0;
+    if (pid <= 0 || csops(pid, kCSOpsStatus, &flags, sizeof(flags)) != 0) return VD_REPLY_UNVERIFIABLE;
+    if (!(flags & kCSValid)) return VD_REPLY_NOT_APP;
+    char blob[300] = {0};  // 8-byte blob header, then the identifier
+    if (csops(pid, kCSOpsIdentity, blob, sizeof(blob) - 1) != 0) return VD_REPLY_UNVERIFIABLE;
+    if (strcmp(blob + 8, kRequiredIdentifier) != 0) return VD_REPLY_NOT_APP;
+#ifdef VD_REQUIRED_TEAM_ID
+    char team[300] = {0};
+    if (csops(pid, kCSOpsTeamID, team, sizeof(team) - 1) != 0 || strcmp(team + 8, VD_REQUIRED_TEAM_ID) != 0) return VD_REPLY_NOT_APP;
+#endif
+    return VD_REPLY_ATTACHED;
+}
+
+#ifdef VD_TESTING
+__attribute__((visibility("default"))) uint32_t VolumistDriver_TestCheckApp(pid_t pid);
+__attribute__((visibility("default"))) uint32_t VolumistDriver_TestCheckApp(pid_t pid) { return CheckApp(pid); }
+#endif
+
 static bool HostIsAlive(VDShared *shared, uint64_t now) {
     pid_t pid = (pid_t)shared->hostPID;
     if (pid <= 0) return false;
     if (kill(pid, 0) != 0 && errno != EPERM) return false;
+    if (gSocket >= 0) {
+        // The app closes its end when it quits; a crash closes it too.
+        struct pollfd fd = {gSocket, POLLIN, 0};
+        if (poll(&fd, 1, 0) > 0) {
+            char byte;
+            if ((fd.revents & (POLLHUP | POLLERR)) || recv(gSocket, &byte, 1, MSG_DONTWAIT) == 0) return false;
+        }
+    }
     uint64_t beat = vd_load64(&shared->heartbeatNanos);
     return beat != 0 && (now < beat || now - beat <= VD_HEARTBEAT_TIMEOUT_NS);
 }
 
+/// Receives the handshake and the descriptor that comes with it.
+static bool ReceiveMemory(int fd, VDHandshake *handshake, int *memoryFD) {
+    struct iovec iov = {handshake, sizeof(*handshake)};
+    union { struct cmsghdr header; char space[CMSG_SPACE(sizeof(int))]; } control;
+    memset(&control, 0, sizeof(control));
+    struct msghdr message = {0};
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.space;
+    message.msg_controllen = sizeof(control.space);
+    *memoryFD = -1;
+    if (recvmsg(fd, &message, MSG_WAITALL) != sizeof(*handshake)) return false;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&message); cmsg; cmsg = CMSG_NXTHDR(&message, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len == CMSG_LEN(sizeof(int))) {
+            memcpy(memoryFD, CMSG_DATA(cmsg), sizeof(int));
+        }
+    }
+    return *memoryFD >= 0;
+}
+
 static void TryAttachLocked(uint64_t now) {
-    int fd = shm_open(VD_SHM_NAME, O_RDWR);
-    if (fd < 0) return;  // app not running
-    void *mapped = mmap(NULL, sizeof(VDShared), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    int mapErrno = errno;
-    close(fd);
-    if (mapped == MAP_FAILED) {
-        os_log_error(gLog, "attach: mmap failed: %d", mapErrno);
+    if (now < gNextAttemptNanos) return;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+    struct timeval timeout = {1, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, kSocketPath, sizeof(address.sun_path));
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);  // app not running
         return;
     }
-    VDShared *shared = mapped;
-    if (shared->magic != VD_MAGIC || shared->version != VD_VERSION || !HostIsAlive(shared, now)) {
-        munmap(mapped, sizeof(VDShared));
+
+    pid_t peer = 0;
+    socklen_t length = sizeof(peer);
+    uint32_t status = getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &peer, &length) == 0 ? CheckApp(peer) : VD_REPLY_UNVERIFIABLE;
+
+    VDHandshake handshake = {0};
+    int memoryFD = -1;
+    bool received = ReceiveMemory(fd, &handshake, &memoryFD);
+    VDShared *shared = NULL;
+    if (status == VD_REPLY_ATTACHED) {
+        status = VD_REPLY_BAD_MEMORY;
+        if (received && handshake.magic == VD_MAGIC && handshake.version == VD_VERSION && handshake.size == sizeof(VDShared)) {
+            void *mapped = mmap(NULL, sizeof(VDShared), PROT_READ | PROT_WRITE, MAP_SHARED, memoryFD, 0);
+            if (mapped != MAP_FAILED) {
+                shared = mapped;
+                if (shared->magic == VD_MAGIC && shared->version == VD_VERSION && (pid_t)shared->hostPID == peer) {
+                    // Don't attach to an app that's stalled; we'd only detach again on the next poll.
+                    status = HostIsAlive(shared, now) ? VD_REPLY_ATTACHED : VD_REPLY_NOT_READY;
+                }
+                if (status != VD_REPLY_ATTACHED) {
+                    munmap(mapped, sizeof(VDShared));
+                    shared = NULL;
+                }
+            }
+        }
+    }
+    if (memoryFD >= 0) close(memoryFD);  // the mapping keeps the memory alive
+    VDReply reply = {VD_MAGIC, status};
+    send(fd, &reply, sizeof(reply), 0);
+    if (status != VD_REPLY_ATTACHED) {
+        if (status != VD_REPLY_NOT_READY) os_log_error(gLog, "handover refused (status %u, peer %d)", status, peer);
+        close(fd);
+        gNextAttemptNanos = now + (status == VD_REPLY_NOT_READY ? kRetryAfterFailureNs / 4 : kRetryAfterFailureNs);
         return;
     }
+
     if (gRetired && gIOCount == 0) {
         munmap(gRetired, sizeof(VDShared));
         gRetired = NULL;
     }
+    gSocket = fd;
     // Requests made before we attached apply now.
     gLastVolumeRequestSeq = 0;
     gLastMuteRequestSeq = 0;
@@ -262,11 +377,15 @@ static void TryAttachLocked(uint64_t now) {
     vd_add32(&shared->attachCount, 1);
     for (int i = 0; i < VD_MAX_CLIENTS; i++) PublishClientLocked(shared, i);
     atomic_store_explicit(&gShared, shared, memory_order_release);
-    os_log(gLog, "attached to app pid %u", shared->hostPID);
+    os_log(gLog, "attached to app pid %d", peer);
 }
 
 static void DetachLocked(void) {
     VDShared *shared = atomic_exchange(&gShared, NULL);
+    if (gSocket >= 0) {
+        close(gSocket);
+        gSocket = -1;
+    }
     if (!shared) return;
     vd_store32(&shared->deviceVisible, 0);
     if (gRetired) munmap(gRetired, sizeof(VDShared));
@@ -288,6 +407,10 @@ static void Poll(void) {
     if (!shared) {
         TryAttachLocked(now);
         shared = atomic_load(&gShared);
+        if (shared && !HostIsAlive(shared, now)) {
+            DetachLocked();
+            shared = NULL;
+        }
     }
 
     bool visible = shared != NULL;

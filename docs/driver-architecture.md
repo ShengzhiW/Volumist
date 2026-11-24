@@ -112,7 +112,7 @@ Findings that change the plan:
 - **Sample rate follows the real output:** it switched to 44.1 kHz for BlackHole and stayed at 48 kHz for the Audioengine.
 - **Owner lookup works inside coreaudiod's sandbox** (`ownerLookupWorks = 1`). The app still publishes rules for an app's helper processes itself (`owner` rules in `vd-host`), which covers helpers the driver reports as their own owner.
 - Not yet verified on the real system: volume keys mirrored to the real device (covered by the in-process tests).
-- **Security is still open:** the shared memory is created world-readable/writable (0666) so the `_coreaudiod` driver can open it, which lets any local process read the mix or change gains. Before shipping, hand the driver a file descriptor over a socket and verify the app's code signature instead of using a named region.
+- **Security (fixed in phase 5):** phase 1's shared memory was world-readable/writable (0666) so the `_coreaudiod` driver could open it, which let any local process read the mix or change gains. Phase 5 replaced it with a descriptor handed over a verified socket.
 
 **2. App output engine.** Ring buffer to real device, drift handling, default-device takeover and restore, volume and mute mirroring.
 
@@ -139,6 +139,16 @@ Verified on this Mac: Uninstall then Install from Settings both worked with the 
 Found while testing and fixed: **a second copy of Volumist broke the first's routing.** It replaced the shared memory, and when it exited the device vanished while the first copy still thought the driver was running. The app now exits at launch if another copy (same bundle ID, debug or installed) is already running.
 
 **5. Hardening.** Sample-rate and device changes, Bluetooth and AirPlay, sleep and wake, crash recovery, apps that pick a specific device.
+
+*Phase 5 status (2026-11-24): security done; other hardening partly done.*
+
+- **Shared memory is private now (protocol v2, driver 1.1).** The app creates the region with `shm_open` and unlinks it at once, so it has no name. It listens on `/tmp/app.volumist.driver.sock` and hands the descriptor (`SCM_RIGHTS`) only to a peer running as `_coreaudiod` (`getpeereid`). The driver connects, takes the peer's PID (`LOCAL_PEERPID`), and asks the kernel for its code signature (`csops`: valid, identifier `app.volumist.Volumist`, plus a team ID check when `VD_REQUIRED_TEAM_ID` is set for signed releases). Only then does it map the memory, and it replies to the app (attached, not the app, unverifiable, bad memory, not ready). The open connection doubles as liveness: when the app quits or crashes, the device disappears immediately.
+- **Verified on this Mac:** the update from Settings installed 1.1 (2), and the running app switched to it with no relaunch. `csops` works inside coreaudiod's driver sandbox. A probe connecting as the user got the connection closed with no descriptor, and Volumist was unaffected.
+- **Fallback:** if the device hasn't appeared 5 s after the engine starts, the app switches to audio capture and Settings explains why. Verified with the old driver still installed.
+- **Bluetooth headset rates:** the driver also runs at 8, 11.025, 16, 22.05, 24 and 32 kHz.
+- **Wake:** the app re-establishes playback to the real output after `NSWorkspace.didWakeNotification`. Not yet exercised on a real sleep.
+- **Tests:** 51 driver checks (a `VD_TESTING` build with its own socket, accepting the test program) and 37 engine checks. The driver tests now use the real engine as the app, so both ends of the handover are covered, including rejecting other programs and other accounts.
+- **Still open:** AirPlay and real Bluetooth headset switching on this Mac; a real sleep/wake; the one resync at startup; apps that pick their own output device (they bypass the driver; nothing to do but document it).
 
 **6. Decide on taps.** Keep the tap engine as a fallback ("Use audio driver" on or off) until the driver path is proven, then remove it or keep it for users who won't install a driver.
 

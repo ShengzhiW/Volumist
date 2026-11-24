@@ -33,12 +33,10 @@ EOF
 chmod +x $WORK/install-scripts/postinstall $WORK/uninstall-scripts/postinstall
 
 pkgbuild --root $WORK/root --install-location / --ownership recommended \
-  --identifier app.volumist.driver --version 1.0 \
+  --identifier app.volumist.driver --version 1.1 \
   --scripts $WORK/install-scripts "build/Install Volumist Driver.pkg"
-pkgbuild --nopayload --identifier app.volumist.driver.uninstall --version 1.0 \
+pkgbuild --nopayload --identifier app.volumist.driver.uninstall --version 1.1 \
   --scripts $WORK/uninstall-scripts "build/Uninstall Volumist Driver.pkg"
 rm -rf $WORK
 
-clang -O2 -Wall -Wextra -Werror -mmacosx-version-min=15.0 -framework CoreAudio -framework CoreFoundation \
-  -o build/vd-host Tools/vd-host.c
-echo "Installers and vd-host are in $PWD/build"
+echo "Installers are in $PWD/build (the app can also install the driver itself: Settings > General)"

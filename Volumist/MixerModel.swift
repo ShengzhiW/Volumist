@@ -90,6 +90,9 @@ final class MixerModel: ObservableObject {
     @Published private(set) var driverBusy = false
     @Published private(set) var driverError: String?
     private var awaitingAudioRestart = false
+    /// The driver didn't respond this session; use audio capture until the user acts in Settings,
+    /// Core Audio restarts, or the app relaunches.
+    private var driverFailed = false
     private static let realOutputKey = "driverRealOutputUID"
     private static let engineActiveKey = "driverEngineActive"
 
@@ -126,6 +129,15 @@ final class MixerModel: ObservableObject {
         nowPlaying.onChange = { [weak self] in self?.applyNowPlaying() }
 
         installSystemListeners()
+
+        // After sleep, play to the real output again (its IO may not have come back on its own).
+        workspaceObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                MainActor.assumeIsolated { self?.reestablishOutput() }
+            }
+        })
 
         // A newly launched app gets its saved volume before it makes a sound.
         workspaceObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
@@ -625,7 +637,7 @@ final class MixerModel: ObservableObject {
     /// Uses the Volumist driver when it's installed (unless Settings chooses audio capture), else taps.
     func configureEngine() {
         let wantDriver = UserDefaults.standard.string(forKey: Preferences.audioEngine) != Preferences.engineCapture
-            && DriverEngine.isInstalled
+            && DriverEngine.isInstalled && !driverFailed
         if wantDriver, driver == nil { startDriver() }
         if !wantDriver, driver != nil { stopDriver() }
         usingDriver = driver != nil
@@ -653,6 +665,29 @@ final class MixerModel: ObservableObject {
         }
         publishRules()
         log.info("Driver engine started, playing to \(real.name, privacy: .public)")
+        // If the device never appears (outdated driver, refused handover), fall back to audio
+        // capture rather than leave per-app volume dead.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak engine] in
+            guard let self, let engine, self.driver === engine, !engine.isDeviceVisible else { return }
+            self.driverDidNotRespond(reply: engine.driverReply)
+        }
+    }
+
+    private func driverDidNotRespond(reply: Int32?) {
+        switch reply.map(Int.init) {
+        case Int(VD_REPLY_NOT_APP):
+            driverError = "The audio driver refused this copy of Volumist (its code signature didn't match). Using audio capture."
+        case Int(VD_REPLY_UNVERIFIABLE):
+            driverError = "The audio driver couldn't verify this copy of Volumist. Using audio capture."
+        case .some:
+            driverError = "The audio driver couldn't use Volumist's shared memory. Updating the driver should fix this. Using audio capture."
+        case nil:
+            driverError = "The audio driver didn't connect. It may be out of date: update it below. Using audio capture."
+        }
+        log.error("Driver didn't respond (reply \(reply.map(String.init) ?? "none", privacy: .public)); falling back to audio capture")
+        driverFailed = true
+        stopDriver()
+        configureEngine()
     }
 
     /// Gives the default output back to the real device, then removes the Volumist device.
@@ -670,6 +705,13 @@ final class MixerModel: ObservableObject {
         UserDefaults.standard.set(false, forKey: Self.engineActiveKey)
         stoppingDriver = false
         defaultDeviceChanged(.output)
+    }
+
+    /// The user changed the engine in Settings: try the driver again if it's chosen.
+    func engineChoiceChanged() {
+        driverFailed = false
+        driverError = nil
+        configureEngine()
     }
 
     // MARK: - Installing the driver
@@ -690,6 +732,7 @@ final class MixerModel: ObservableObject {
         guard !driverBusy else { return }
         driverBusy = true
         driverError = nil
+        driverFailed = false
         // Give the default output back to the real device before Core Audio restarts.
         stopDriver()
         awaitingAudioRestart = true
@@ -720,6 +763,7 @@ final class MixerModel: ObservableObject {
     /// object is new, so drop everything that refers to the old ones and set up again.
     private func audioServiceRestarted() {
         awaitingAudioRestart = false
+        driverFailed = false
         log.info("Core Audio restarted; rebuilding")
         if let driver {
             // Not stopDriver(): the old devices are gone, and keeping the "engine active" flag
@@ -757,6 +801,12 @@ final class MixerModel: ObservableObject {
             ?? saved
             ?? candidates.first { $0.transportType == kAudioDeviceTransportTypeBuiltIn }
             ?? candidates.first
+    }
+
+    private func reestablishOutput() {
+        guard driver != nil, let device = AudioDevices.device(for: output.selectedID, .output) else { return }
+        log.info("Re-establishing output to \(device.name, privacy: .public) after wake")
+        useRealOutput(device)
     }
 
     private func useRealOutput(_ device: AudioDevice) {

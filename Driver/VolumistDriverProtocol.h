@@ -1,9 +1,12 @@
 // Shared-memory protocol between Volumist.app and the Volumist audio driver.
 //
-// The app creates the region (VD_SHM_NAME) and keeps a heartbeat in it. The driver, inside
-// coreaudiod's driver service, attaches when the region appears and publishes the "Volumist"
-// device only while the heartbeat is fresh, so if the app quits or crashes the device vanishes
-// and macOS falls back to the real output.
+// The app creates the region as unnamed shared memory and listens on VD_SOCKET_PATH. The driver,
+// inside coreaudiod's driver service, connects, checks the app's code signature, and receives the
+// region's file descriptor (SCM_RIGHTS); the app only hands it to peers running as _coreaudiod.
+// So only Core Audio (or root) can read the mix or change gains, and there's no name to open.
+// The driver publishes the "Volumist" device only while the connection is open and the heartbeat
+// is fresh, so if the app quits or crashes the device vanishes and macOS falls back to the real
+// output.
 //
 // Fields are plain integers so Swift can import the structs. Every cross-process access goes
 // through the vd_* inline accessors, which use C11 atomic builtins.
@@ -11,9 +14,10 @@
 
 #include <stdint.h>
 
-#define VD_SHM_NAME "/app.volumist.driver.v1"  // macOS limits shm names to 31 characters
+#define VD_SOCKET_PATH "/tmp/app.volumist.driver.sock"
+#define VD_APP_IDENTIFIER "app.volumist.Volumist"  // code-signing identifier the driver requires
 #define VD_MAGIC 0x5644584Du                   // 'VDXM'
-#define VD_VERSION 1u
+#define VD_VERSION 2u
 #define VD_DEVICE_UID "app.volumist.device"
 #define VD_MAX_CLIENTS 256
 #define VD_MAX_RULES 256
@@ -21,6 +25,26 @@
 #define VD_RING_FRAMES 32768u                   // power of two; ~170 ms at 192 kHz
 #define VD_HEARTBEAT_TIMEOUT_NS 1500000000ull   // device disappears 1.5 s after the app stops beating
 #define VD_BUNDLE_ID_LENGTH 128
+
+/// Sent by the app with the shared memory's file descriptor.
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t size;        // sizeof(VDShared)
+} VDHandshake;
+
+/// The driver's answer on the same connection.
+enum {
+    VD_REPLY_ATTACHED = 0,
+    VD_REPLY_NOT_APP = 1,        // peer isn't a validly signed Volumist
+    VD_REPLY_UNVERIFIABLE = 2,   // couldn't read the peer's code signature
+    VD_REPLY_BAD_MEMORY = 3,     // descriptor missing, wrong size, or wrong header
+    VD_REPLY_NOT_READY = 4,      // the app's heartbeat is stale; the driver retries shortly
+};
+typedef struct {
+    uint32_t magic;
+    uint32_t status;
+} VDReply;
 
 /// Gain rule published by the app. A client gets the gain of the first rule that matches, in
 /// order of precedence: its own PID, its owner's PID (the app responsible for a helper process,

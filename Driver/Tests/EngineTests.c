@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../../Volumist/Engine/VolumistEngine.h"
 #include "../VolumistDriverProtocol.h"
@@ -99,7 +100,7 @@ static Result Run(Sim *sim, double drift, int writeFrames, int readFrames, doubl
 
 static Sim NewSim(void) {
     Sim sim = {0};
-    sim.engine = ve_create("/volumist.etest");
+    sim.engine = ve_create("/tmp/volumist.enginetest.sock", (int)getuid());
     if (!sim.engine) { fprintf(stderr, "ve_create failed\n"); exit(1); }
     sim.shared = ve_shared_for_test(sim.engine);
     return sim;

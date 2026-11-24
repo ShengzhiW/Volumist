@@ -1,6 +1,7 @@
-// The app side of the Volumist driver: creates the shared memory and heartbeat that make the
-// "Volumist" device appear, publishes per-app gain rules, and plays the driver's mix to the real
-// output device with drift correction. C because the render path is real-time.
+// The app side of the Volumist driver: creates the shared memory (unnamed) and heartbeat that make
+// the "Volumist" device appear, hands the memory to the driver over a socket, publishes per-app
+// gain rules, and plays the driver's mix to the real output device with drift correction. C
+// because the render path is real-time.
 #pragma once
 
 #include <CoreAudio/CoreAudio.h>
@@ -23,8 +24,10 @@ typedef struct {
     float peak;           // max |sample| after gain since the last call
 } VEPeak;
 
-/// Creates the shared memory (named `name`, or the driver's name if NULL) and starts the heartbeat.
-VEEngine *ve_create(const char *name);
+/// Creates the shared memory, starts the heartbeat, and listens on `socketPath` (the driver's path
+/// if NULL). The memory is only handed to peers running as `peerUID`; pass -1 for Core Audio's
+/// _coreaudiod account (what the real driver runs as).
+VEEngine *ve_create(const char *socketPath, int peerUID);
 /// Stops output and removes the shared memory; the Volumist device disappears.
 void ve_destroy(VEEngine *engine);
 
@@ -41,6 +44,9 @@ void ve_rules_commit(VEEngine *engine);
 
 bool ve_device_visible(VEEngine *engine);
 
+/// The driver's last answer to the handover (VD_REPLY_*), or -1 if no driver has connected yet.
+int ve_driver_reply(VEEngine *engine);
+
 /// The Volumist device's own volume/mute (volume keys, Sound menu). `sequence` changes when either does.
 uint32_t ve_device_volume_sequence(VEEngine *engine);
 float ve_device_volume(VEEngine *engine);
@@ -54,5 +60,6 @@ VEStats ve_stats(VEEngine *engine);
 
 /// Renders one output buffer from the ring (what the IOProc calls). Exposed for tests.
 void ve_render(VEEngine *engine, AudioBufferList *output, double outputRate);
-/// Test hook: the shared memory, so a test can play the driver's part.
+/// Test hooks: the shared memory, so a test can play the driver's part; pausing the heartbeat.
 void *ve_shared_for_test(VEEngine *engine);
+void ve_pause_heartbeat_for_test(VEEngine *engine, bool paused);

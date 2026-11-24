@@ -134,7 +134,7 @@ struct GeneralSettingsView: View {
                     Text("Volumist audio driver").tag(Preferences.engineDriver)
                     Text("Audio capture").tag(Preferences.engineCapture)
                 }
-                .onChange(of: audioEngine) { model.configureEngine() }
+                .onChange(of: audioEngine) { model.engineChoiceChanged() }
                 LabeledContent("Volumist audio driver") {
                     HStack(spacing: 8) {
                         if model.driverBusy { ProgressView().controlSize(.small) }
