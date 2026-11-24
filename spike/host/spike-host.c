@@ -2,10 +2,16 @@
 // and plays the driver's mix to a real output device. Prints what the driver reports.
 //
 //   spike-host [--out <deviceUID>] [--gain-all <g>] [--gain <pid> <g>]... [--seconds <n>] [--latency <frames>]
+//              [--gains-file <path>] [--csv <path>]
+//
+// --gains-file: re-read every second; each line "<text> <gain>" sets that gain for every client
+// whose owning app's path contains <text> (e.g. "Safari 0.3"). --csv: per-second timing log.
 
 #include <CoreAudio/CoreAudio.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <libproc.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,6 +124,35 @@ static void DisableInputStreams(AudioObjectID device, AudioDeviceIOProcID proc) 
     free(usage);
 }
 
+/// Path of the app responsible for a process (Safari for its WebKit helpers).
+static void OwnerPath(int32_t pid, char *path, size_t size) {
+    typedef pid_t (*ResponsibleFn)(pid_t);
+    static ResponsibleFn responsible = NULL;
+    if (!responsible) responsible = (ResponsibleFn)dlsym(RTLD_DEFAULT, "responsibility_get_pid_responsible_for_pid");
+    pid_t owner = responsible ? responsible(pid) : pid;
+    if (owner <= 0) owner = pid;
+    path[0] = 0;
+    if (proc_pidpath(owner, path, (uint32_t)size) <= 0) snprintf(path, size, "pid %d", owner);
+}
+
+static void SetGain(int32_t pid, float gain);
+
+static void ApplyGainsFile(const char *file) {
+    FILE *f = fopen(file, "r");
+    if (!f) return;
+    char text[128]; float gain;
+    while (fscanf(f, "%127s %f", text, &gain) == 2) {
+        for (int i = 0; i < VSPIKE_MAX_CLIENTS; i++) {
+            int32_t pid = atomic_load(&gShared->clients[i].pid);
+            if (pid <= 0) continue;
+            char path[PROC_PIDPATHINFO_MAXSIZE];
+            OwnerPath(pid, path, sizeof(path));
+            if (strstr(path, text)) SetGain(pid, gain);
+        }
+    }
+    fclose(f);
+}
+
 static void SetGain(int32_t pid, float gain) {
     for (int i = 0; i < VSPIKE_MAX_CLIENTS; i++) {
         if (atomic_load(&gShared->gains[i].pid) == pid) { atomic_store(&gShared->gains[i].gainBits, F2Bits(gain)); return; }
@@ -133,6 +168,8 @@ static void SetGain(int32_t pid, float gain) {
 
 int main(int argc, char **argv) {
     const char *outUID = NULL;
+    const char *gainsFile = NULL;
+    const char *csvPath = NULL;
     float gainAll = -1;
     int seconds = 15;
     int32_t gainPIDs[16]; float gainValues[16]; int gainCount = 0;
@@ -142,6 +179,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--gain") && i + 2 < argc && gainCount < 16) { gainPIDs[gainCount] = atoi(argv[++i]); gainValues[gainCount++] = (float)atof(argv[++i]); }
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--latency") && i + 1 < argc) gLatency = (uint64_t)atoll(argv[++i]);
+        else if (!strcmp(argv[i], "--gains-file") && i + 1 < argc) gainsFile = argv[++i];
+        else if (!strcmp(argv[i], "--csv") && i + 1 < argc) csvPath = argv[++i];
         else { fprintf(stderr, "usage: %s [--out uid] [--gain-all g] [--gain pid g] [--seconds n] [--latency frames]\n", argv[0]); return 2; }
     }
 
@@ -180,28 +219,44 @@ int main(int argc, char **argv) {
     if (status == noErr) status = AudioDeviceStart(device, proc);
     if (status != noErr) { fprintf(stderr, "could not start output: %d\n", (int)status); return 1; }
 
+    FILE *csv = csvPath ? fopen(csvPath, "w") : NULL;
+    if (csv) fprintf(csv, "second,writeFrame,lag,underruns,resyncs\n");
     uint64_t lastWrite = 0;
     for (int second = 1; second <= seconds; second++) {
         sleep(1);
         atomic_fetch_add(&gShared->hostHeartbeat, 1);
         for (int i = 0; i < gainCount; i++) SetGain(gainPIDs[i], gainValues[i]);
+        if (gainsFile) ApplyGainsFile(gainsFile);
         uint64_t write = atomic_load(&gShared->writeFrame);
         printf("[%2ds] attaches=%llu mixCycles=%llu frames/s=%llu lag=%lld underruns=%llu resyncs=%llu outPeak=%.4f\n",
                second, atomic_load(&gShared->driverAttachCount), atomic_load(&gShared->mixCycles),
                lastWrite ? write - lastWrite : 0, atomic_load(&gLag), atomic_load(&gUnderruns), atomic_load(&gResyncs),
                Bits2F(atomic_exchange(&gOutPeakBits, 0)));
         lastWrite = write;
+        if (csv) {
+            fprintf(csv, "%d,%llu,%lld,%llu,%llu\n", second, write, atomic_load(&gLag), atomic_load(&gUnderruns), atomic_load(&gResyncs));
+            fflush(csv);
+        }
         for (int i = 0; i < VSPIKE_MAX_CLIENTS; i++) {
             int32_t pid = atomic_load(&gShared->clients[i].pid);
             if (pid <= 0) continue;
             if (gainAll >= 0) SetGain(pid, gainAll);
-            printf("        client pid=%-6d bundle=%-40s peak=%.4f\n", pid,
-                   gShared->clients[i].bundleID[0] ? gShared->clients[i].bundleID : "(none)",
-                   Bits2F(atomic_exchange(&gShared->clients[i].peakBits, 0)));
+            float peak = Bits2F(atomic_exchange(&gShared->clients[i].peakBits, 0));
+            if (peak <= 0) continue;
+            char path[PROC_PIDPATHINFO_MAXSIZE];
+            OwnerPath(pid, path, sizeof(path));
+            const char *owner = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+            float gain = 1;
+            for (int g = 0; g < VSPIKE_MAX_CLIENTS; g++) {
+                if (atomic_load(&gShared->gains[g].pid) == pid) gain = Bits2F(atomic_load(&gShared->gains[g].gainBits));
+            }
+            printf("        client pid=%-6d bundle=%-28s owner=%-16s gain=%.2f peak=%.4f\n", pid,
+                   gShared->clients[i].bundleID[0] ? gShared->clients[i].bundleID : "(none)", owner, gain, peak);
         }
         fflush(stdout);
     }
 
+    if (csv) fclose(csv);
     AudioDeviceStop(device, proc);
     AudioDeviceDestroyIOProcID(device, proc);
     shm_unlink(VSPIKE_SHM_NAME);

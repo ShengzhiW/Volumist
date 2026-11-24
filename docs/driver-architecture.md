@@ -94,7 +94,13 @@ Findings that change the plan:
 - **Clock drift is still unmeasured.** BlackHole runs at 44.1 kHz, so the host fell behind about 4,000 frames/s and resynced. That's a rate mismatch, not drift. Drift and latency need a 48 kHz real output (or rate conversion in the host).
 - **Never start input you don't use.** When the app's output device also has an input (BlackHole, USB headsets, audio interfaces), turn its input streams off with `kAudioDevicePropertyIOProcStreamUsage`, or macOS shows the microphone indicator. The current tap-based Volumist has the same exposure: its aggregate devices include the output device's input streams.
 - **The driver's `os_log` messages don't appear in `log show`.** Diagnostics should go through shared-memory counters, as this spike's do.
-- Not yet tried: playing a real app (Safari) through the spike device, and the route where the driver plays to hardware itself.
+*Listening test (2026-11-24),* 5 minutes. Default output set to "Volumist Spike", the host playing the mix to the Audioengine 2+ (USB, 48 kHz, no inputs), Safari playing video:
+
+- **Real app: works.** Safari's audio arrives from its `com.apple.WebKit.GPU` helper. `responsibility_get_pid_responsible_for_pid` traces it to Safari, and a gain keyed to Safari applied only to it. 30% dropped its peak from about 0.75 to 0.05 within a second, audibly quieter with no clicks; back to 100% restored it. Judged by ear: "quieter, sounds fine".
+- **Dropouts: none while playing.** About 225 s of continuous playback across 4 stretches had 0 underruns. All 305 underruns happened while nothing was playing and the device's IO had stopped, so the host was starved, which is expected.
+- **Latency:** the host's buffer held 1,340–2,300 frames (28–48 ms) on top of the device buffers, with a 2,048-frame target. No lip-sync complaint, but that's near the noticeable range; the real engine should aim for 512–1,024 frames.
+- **Drift: small but real.** Over the longest stretch (149 s) the buffer level trended about −2 frames/s (about −40 ppm). That's within per-buffer jitter, so it's a rough figure. At that rate an uncorrected buffer would hit its limit and glitch every few minutes to tens of minutes. **Phase 2 needs drift correction**: adaptive resampling in the app, or clocking the virtual device from the real one.
+- Not yet tried: the route where the driver plays to hardware itself.
 
 **1. Driver MVP.** Virtual device, client table, per-client gain, mix into the ring buffer, heartbeat, remove the device on disconnect.
 
