@@ -6,18 +6,10 @@ struct MenuContentView: View {
     @Environment(\.openVolumistSettings) private var openSettings
     @AppStorage(Preferences.showOutputSection) private var showOutputSection = true
     @AppStorage(Preferences.showInputSection) private var showInputSection = true
-    /// Device lists start collapsed to the selected device every time the menu opens.
-    @State private var outputExpanded: Bool
-    @State private var inputExpanded: Bool
-
-    /// `expanded` is for previews; the live menu always opens collapsed.
-    private let collapsesOnOpen: Bool
-
-    init(expanded: Bool = false) {
-        _outputExpanded = State(initialValue: expanded)
-        _inputExpanded = State(initialValue: expanded)
-        collapsesOnOpen = !expanded
-    }
+    /// Whether each device list shows every device or just the selected one. Remembered
+    /// across menu openings and launches.
+    @AppStorage(Preferences.outputExpanded) private var outputExpanded = false
+    @AppStorage(Preferences.inputExpanded) private var inputExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -79,10 +71,6 @@ struct MenuContentView: View {
     }
 
     private func menuOpened() {
-        if collapsesOnOpen {
-            outputExpanded = false
-            inputExpanded = false
-        }
         model.menuWillOpen()
     }
 }
@@ -237,7 +225,8 @@ private struct PermissionRow: View {
 
 // MARK: - Devices
 
-/// A device list that shows only the selected device until its header is clicked.
+/// A device list that shows either every device or only the selected one; clicking the
+/// header switches between the two.
 private struct DeviceSection: View {
     @EnvironmentObject private var model: MixerModel
     let title: String
@@ -254,7 +243,6 @@ private struct DeviceSection: View {
         ForEach(showAll ? state.devices : state.selected.map { [$0] } ?? []) { device in
             DeviceRow(device: device, isSelected: device.id == state.selectedID) {
                 model.select(device)
-                withAnimation(.easeInOut(duration: 0.18)) { isExpanded = false }
             }
             .transition(.opacity)
         }

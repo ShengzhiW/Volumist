@@ -7,6 +7,8 @@ enum Preferences {
     static let appVolumeStep = "appVolumeStep"
     static let showOutputSection = "showOutputSection"
     static let showInputSection = "showInputSection"
+    static let outputExpanded = "outputDevicesExpanded"
+    static let inputExpanded = "inputDevicesExpanded"
 
     /// Slider snapping choices: 0 means continuous.
     static let volumeSteps: [(value: Double, label: String)] = [
