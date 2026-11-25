@@ -291,10 +291,10 @@ private struct DeviceRow: View {
         .overlay(alignment: .trailing) {
             if let isExpanded {
                 Button(action: toggleExpanded) {
-                    Image(systemName: "chevron.down")
+                    Image(systemName: "chevron.right")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .frame(width: 28, height: 28)
                         .contentShape(Rectangle())
                 }
