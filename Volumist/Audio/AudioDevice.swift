@@ -21,6 +21,9 @@ struct AudioDevice: Identifiable, Hashable {
     let name: String
     let transportType: UInt32
     let direction: AudioDirection
+    /// False for Bluetooth headphones that are connected but idle: macOS hides AirPods while
+    /// they're out of your ears or off your head, yet still lists them in the Sound menu.
+    var isActive = true
 
     /// SF Symbol that mirrors the icons the system Sound menu uses.
     var symbolName: String {
@@ -57,19 +60,34 @@ enum AudioDevices {
     /// left out of device lists (the menu shows the real device its mix plays to instead).
     static let volumistDeviceUID = "app.volumist.device"
 
-    static func all(_ direction: AudioDirection) -> [AudioDevice] {
+    /// The devices in `direction`. `includeIdle` adds connected Bluetooth headphones that macOS
+    /// hides while they aren't being worn (only the driver engine can play to those).
+    static func all(_ direction: AudioDirection, includeIdle: Bool = false) -> [AudioDevice] {
         let ids = CA.getArray(.system, CA.address(kAudioHardwarePropertyDevices), zero: AudioObjectID.unknown)
-        let devices = ids.compactMap { device(for: $0, direction) }
+        var devices = ids.compactMap { device(for: $0, direction) }
             .filter { !$0.uid.hasPrefix(privateUIDPrefix) && $0.uid != volumistDeviceUID }
+        if includeIdle {
+            // Hidden devices aren't in the device list, but the system object still owns them.
+            let owned = CA.getArray(.system, CA.address(kAudioObjectPropertyOwnedObjects), zero: AudioObjectID.unknown)
+            for id in owned where !ids.contains(id) {
+                guard var idle = device(for: id, direction, allowHidden: true),
+                      idle.transportType == kAudioDeviceTransportTypeBluetooth
+                          || idle.transportType == kAudioDeviceTransportTypeBluetoothLE,
+                      CA.get(id, CA.address(kAudioDevicePropertyDeviceIsAlive), initial: UInt32(0)) == 1,
+                      !devices.contains(where: { $0.uid == idle.uid }) else { continue }
+                idle.isActive = false
+                devices.append(idle)
+            }
+        }
         // Like the system menu: built-in devices first, everything else in Core Audio's order.
         return devices.filter { $0.transportType == kAudioDeviceTransportTypeBuiltIn }
             + devices.filter { $0.transportType != kAudioDeviceTransportTypeBuiltIn }
     }
 
-    static func device(for id: AudioObjectID, _ direction: AudioDirection) -> AudioDevice? {
+    static func device(for id: AudioObjectID, _ direction: AudioDirection, allowHidden: Bool = false) -> AudioDevice? {
         let streams = CA.getArray(id, CA.address(kAudioDevicePropertyStreams, scope: direction.scope), zero: AudioObjectID.unknown)
         guard !streams.isEmpty else { return nil }
-        if let hidden = CA.get(id, CA.address(kAudioDevicePropertyIsHidden), initial: UInt32(0)), hidden != 0 { return nil }
+        if !allowHidden, let hidden = CA.get(id, CA.address(kAudioDevicePropertyIsHidden), initial: UInt32(0)), hidden != 0 { return nil }
         if let canBeDefault = CA.get(id, CA.address(kAudioDevicePropertyDeviceCanBeDefaultDevice, scope: direction.scope), initial: UInt32(1)),
            canBeDefault == 0 { return nil }
         guard let uid = CA.getString(id, CA.address(kAudioDevicePropertyDeviceUID)) else { return nil }
@@ -78,6 +96,27 @@ enum AudioDevices {
         let transport = CA.get(id, CA.address(kAudioDevicePropertyTransportType), initial: UInt32(0)) ?? 0
         return AudioDevice(id: id, uid: uid, name: name, transportType: transport, direction: direction)
     }
+
+    /// Whether this Mac has the audio link to a Bluetooth device right now. AirPods stay listed
+    /// while they play for an iPhone or iPad (automatic switching), and only this flag changes.
+    /// It's an undocumented property of Apple's Bluetooth audio plug-in, so it's nil if missing.
+    static func hasBluetoothAudioLink(_ id: AudioObjectID) -> Bool? {
+        CA.get(id, CA.address(bluetoothAudioLinkSelector), initial: UInt32(0)).map { $0 != 0 }
+    }
+
+    private static let bluetoothAudioLinkSelector: AudioObjectPropertySelector = 0x626F_6163 // 'boac'
+
+    /// Whether AirPods are in your ears (or on your head): 1 means in, 2 out, per earbud. Also
+    /// undocumented; nil for headphones without ear detection.
+    static func isWorn(_ id: AudioObjectID) -> Bool? {
+        let buds = [inEarPrimarySelector, inEarSecondarySelector].compactMap {
+            CA.get(id, CA.address($0), initial: UInt32(0))
+        }
+        return buds.isEmpty ? nil : buds.contains(1)
+    }
+
+    private static let inEarPrimarySelector: AudioObjectPropertySelector = 0x6965_7370 // 'iesp'
+    private static let inEarSecondarySelector: AudioObjectPropertySelector = 0x6965_7373 // 'iess'
 
     static func defaultDeviceID(_ direction: AudioDirection) -> AudioObjectID {
         CA.get(.system, CA.address(direction.defaultDeviceSelector), initial: AudioObjectID.unknown) ?? .unknown

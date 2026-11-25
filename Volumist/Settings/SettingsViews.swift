@@ -111,6 +111,79 @@ struct DevicesSettingsView: View {
     }
 }
 
+// MARK: - Switching
+
+struct SwitchingSettingsView: View {
+    @EnvironmentObject private var model: MixerModel
+
+    var body: some View {
+        Form {
+            Section {
+                if delayedApps.isEmpty {
+                    Text("No delays. Any app takes your headphones back as soon as it plays.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(delayedApps) { app in
+                    HStack(spacing: 10) {
+                        Image(nsImage: app.icon)
+                            .resizable()
+                            .interpolation(.high)
+                            .frame(width: 20, height: 20)
+                        Text(app.name)
+                        Spacer()
+                        Picker("Delay for \(app.name)", selection: Binding(
+                            get: { model.switchDelays[app.id] ?? MixerModel.switchDelayChoices[0] },
+                            set: { model.setSwitchDelay($0, appID: app.id) }
+                        )) {
+                            ForEach(MixerModel.switchDelayChoices, id: \.self) { seconds in
+                                Text(Self.label(seconds)).tag(seconds)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                        Button {
+                            model.setSwitchDelay(nil, appID: app.id)
+                        } label: {
+                            Image(systemName: "minus.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove the delay for \(app.name)")
+                    }
+                }
+                Menu("Add App") {
+                    ForEach(addableApps) { app in
+                        Button(app.name) { model.setSwitchDelay(MixerModel.switchDelayChoices[0], appID: app.id) }
+                    }
+                }
+                .disabled(addableApps.isEmpty)
+                .fixedSize()
+            } header: {
+                Text("Headphone Switching")
+            } footer: {
+                Text("When AirPods or other headphones move to another device, Volumist takes them back as soon as an app plays on this Mac, like macOS does on its own. Apps listed here must play for the chosen time first, so short sounds like message alerts don't take your headphones. macOS alert sounds never do. Applies while the Volumist audio driver is in use.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 480)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var delayedApps: [KnownApp] {
+        model.knownApps.filter { model.switchDelays[$0.id] != nil }
+    }
+
+    private var addableApps: [KnownApp] {
+        model.knownApps.filter { model.switchDelays[$0.id] == nil && !$0.id.hasPrefix("pid:") }
+    }
+
+    private static func label(_ seconds: Double) -> String {
+        seconds < 1 ? "0.5 seconds" : seconds == 1 ? "1 second" : "\(Int(seconds)) seconds"
+    }
+}
+
 // MARK: - General
 
 struct GeneralSettingsView: View {

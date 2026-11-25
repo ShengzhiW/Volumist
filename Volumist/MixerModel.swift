@@ -83,6 +83,34 @@ final class MixerModel: ObservableObject {
     private var lastPushedVolume: Float = -1
     private var lastPushedMute = false
     private var lastPushTime = Date.distantPast
+    /// Until then, leave a device the user picked as the system default instead of reclaiming it.
+    private var holdDefaultUntil = Date.distantPast
+    /// Headphones being taken back from another device, until the Mac has them or time runs out.
+    private var takeover: (id: AudioObjectID, deadline: Date)?
+    /// When the real output's headphones were first seen playing for another device.
+    private var unlinkedSince: Date?
+    /// When the mix last moved to another real output. Only sound that starts after this takes
+    /// headphones back, so the Mac and an iPhone don't trade them back and forth.
+    private var lastRouteChange = Date.distantPast
+    /// Runs while there are headphones to take back, so they come back as soon as the Mac plays.
+    private var reclaimTimer: Timer?
+    private let nowPlayingClaim = NowPlayingClaim()
+    /// A switch to hidden headphones is waiting for the Now Playing claim to register.
+    private var switchPending = false
+    /// After taking hidden headphones, make them the system default for a moment once they
+    /// show up (see trackBluetoothLink).
+    private var bounceDefault: (id: AudioObjectID, until: Date)?
+    /// Per app (menu key): when its sound was last heard, and when its current stretch of sound began.
+    private var lastAudible: [String: Date] = [:]
+    private var audibleSince: [String: Date] = [:]
+    /// Processes that play macOS alert sounds, which never take headphones back.
+    private var alertSoundPIDs: [pid_t: Bool] = [:]
+
+    /// Apps whose sound must last this long (seconds) before it takes headphones back, by bundle
+    /// ID. Every other app takes them back as soon as it plays.
+    @Published private(set) var switchDelays: [String: Double] = [:]
+    private static let switchDelaysKey = "switchDelays"
+    static let switchDelayChoices: [Double] = [0.5, 1, 2]
     private var workspaceObservers: [NSObjectProtocol] = []
     /// The real output the driver's mix plays to, and whether the engine was running (so a
     /// relaunch after a crash can go back to it instead of macOS's fallback device).
@@ -95,6 +123,11 @@ final class MixerModel: ObservableObject {
     private var driverFailed = false
     private static let realOutputKey = "driverRealOutputUID"
     private static let engineActiveKey = "driverEngineActive"
+    /// Outputs the mix has played to, most recent first, for falling back like macOS does.
+    private static let outputHistoryKey = "driverOutputHistory"
+    private static let takeoverTimeout: TimeInterval = 4
+    private static let claimLeadSeconds: TimeInterval = 0.3
+    private static let bounceSeconds: TimeInterval = 0.5
 
     private static let settingsKey = "appSettings"
     private var settings: [String: AppSetting] = [:]
@@ -120,6 +153,7 @@ final class MixerModel: ObservableObject {
 
     init() {
         hiddenApps = Set(UserDefaults.standard.stringArray(forKey: Self.hiddenAppsKey) ?? [])
+        switchDelays = (UserDefaults.standard.dictionary(forKey: Self.switchDelaysKey) as? [String: Double]) ?? [:]
         hiddenDevices = UserDefaults.standard.dictionary(forKey: Self.hiddenDevicesKey) as? [String: String] ?? [:]
         if let data = UserDefaults.standard.data(forKey: Self.settingsKey),
            let saved = try? JSONDecoder().decode([String: AppSetting].self, from: data) {
@@ -350,10 +384,8 @@ final class MixerModel: ObservableObject {
 
     private func readLevels() {
         let now = Date()
-        if let driver {
-            for peak in driver.takePeaks() where peak.level > Self.audibleThreshold {
-                if let key = pidToApp[peak.pid] ?? pidToApp[peak.ownerPID] { lastHeard[key] = now }
-            }
+        if driver != nil {
+            drainDriverPeaks()
             applyAudible()
             return
         }
@@ -363,6 +395,37 @@ final class MixerModel: ObservableObject {
         }
         applyAudible()
     }
+
+    /// Reads which apps the driver heard since the last call, for the menu's level indicators
+    /// and for taking headphones back.
+    private func drainDriverPeaks() {
+        guard let driver else { return }
+        let now = Date()
+        for peak in driver.takePeaks() where peak.level > Self.audibleThreshold {
+            let owner = peak.ownerPID > 0 ? peak.ownerPID : peak.pid
+            if isAlertSoundProcess(peak.pid) || isAlertSoundProcess(owner) { continue }
+            let key = pidToApp[peak.pid] ?? pidToApp[peak.ownerPID]
+                ?? NSRunningApplication(processIdentifier: owner)?.bundleIdentifier ?? "pid:\(owner)"
+            lastHeard[key] = now
+            if lastAudible[key].map({ now.timeIntervalSince($0) > Self.stretchGap }) ?? true { audibleSince[key] = now }
+            lastAudible[key] = now
+        }
+    }
+
+    private func isAlertSoundProcess(_ pid: pid_t) -> Bool {
+        if let known = alertSoundPIDs[pid] { return known }
+        var name = [CChar](repeating: 0, count: 256)
+        let isAlerts = proc_name(pid, &name, UInt32(name.count)) > 0
+            && Self.alertSoundProcessNames.contains(String(cString: name))
+        alertSoundPIDs[pid] = isAlerts
+        return isAlerts
+    }
+
+    private static let alertSoundProcessNames: Set<String> = ["systemsoundserverd", "SystemSoundServer-macOS"]
+    /// An app heard within this long is playing now.
+    private static let soundGap: TimeInterval = 0.3
+    /// Silence longer than this ends an app's stretch of sound; sound after it is a new start.
+    private static let stretchGap: TimeInterval = 1
 
     private func applyAudible() {
         let now = Date()
@@ -442,13 +505,22 @@ final class MixerModel: ObservableObject {
         refreshApps()
     }
 
+    // MARK: - Switching delays
+
+    /// Sets how long `appID` must play before it takes headphones back; nil removes the delay.
+    func setSwitchDelay(_ seconds: Double?, appID: String) {
+        switchDelays[appID] = seconds
+        UserDefaults.standard.set(switchDelays, forKey: Self.switchDelaysKey)
+        refreshKnownApps()
+    }
+
     private func refreshKnownApps() {
         var known: [String: KnownApp] = [:]
         for entry in latest.values {
             known[entry.id] = KnownApp(id: entry.id, name: entry.name, icon: entry.icon, isRunning: true)
         }
         // Hidden or adjusted apps that aren't running: look them up on disk.
-        for id in hiddenApps.union(settings.keys) where known[id] == nil && !id.hasPrefix("pid:") {
+        for id in hiddenApps.union(settings.keys).union(switchDelays.keys) where known[id] == nil && !id.hasPrefix("pid:") {
             guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { continue }
             let name = FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
             known[id] = KnownApp(id: id, name: name, icon: NSWorkspace.shared.icon(forFile: url.path), isRunning: false)
@@ -552,7 +624,9 @@ final class MixerModel: ObservableObject {
     func select(_ device: AudioDevice) {
         // With the driver, Volumist stays the default output; picking a device changes where its mix plays.
         if driver != nil, device.direction == .output {
-            useRealOutput(device)
+            log.info("Picked \(device.name, privacy: .public) in the menu")
+            switchPending = false
+            switchToOutput(device)
             return
         }
         AudioDevices.setDefault(device)
@@ -584,13 +658,30 @@ final class MixerModel: ObservableObject {
     }
 
     private func refreshDevices() {
-        output.devices = AudioDevices.all(.output)
+        let wasActive = output.devices.contains { $0.id == output.selectedID && $0.isActive }
+        // The driver engine can play to headphones macOS hides while they aren't worn, so list
+        // them like the Sound menu does.
+        output.devices = AudioDevices.all(.output, includeIdle: driver != nil)
         input.devices = AudioDevices.all(.input)
-        // The real output went away (unplugged, Bluetooth off): play the mix somewhere that exists.
-        if driver != nil, !output.devices.contains(where: { $0.id == output.selectedID }),
-           let fallback = output.devices.first(where: { $0.transportType == kAudioDeviceTransportTypeBuiltIn }) ?? output.devices.first {
+        // The real output went away (unplugged, AirPods taken off): like macOS, go back to the
+        // output used before it. Picking idle headphones on purpose isn't "going away".
+        guard driver != nil else { return }
+        let current = output.devices.first { $0.id == output.selectedID }
+        if current == nil || (wasActive && current?.isActive == false), let fallback = fallbackOutput() {
             useRealOutput(fallback)
         }
+    }
+
+    /// The most recently used output that's still available, else the built-in one.
+    private func fallbackOutput() -> AudioDevice? {
+        let available = output.devices.filter {
+            $0.isActive && $0.id != output.selectedID && AudioDevices.hasBluetoothAudioLink($0.id) != false
+        }
+        let history = UserDefaults.standard.stringArray(forKey: Self.outputHistoryKey) ?? []
+        for uid in history {
+            if let device = available.first(where: { $0.uid == uid }) { return device }
+        }
+        return available.first { $0.transportType == kAudioDeviceTransportTypeBuiltIn } ?? available.first
     }
 
     private func defaultDeviceChanged(_ direction: AudioDirection) {
@@ -601,6 +692,7 @@ final class MixerModel: ObservableObject {
             // driverTick makes Volumist the default again.
             if id != DriverEngine.deviceID, let device = AudioDevices.device(for: id, .output),
                device.uid != AudioDevices.volumistDeviceUID, device.id != output.selectedID {
+                log.info("System default output changed to \(device.name, privacy: .public)")
                 useRealOutput(device)
             }
             return
@@ -660,6 +752,7 @@ final class MixerModel: ObservableObject {
         lastDriverVolumeSequence = 0
         lastPushedVolume = -1
         useRealOutput(real)
+        refreshDevices()
         driverTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.driverTick() }
         }
@@ -693,6 +786,9 @@ final class MixerModel: ObservableObject {
     /// Gives the default output back to the real device, then removes the Volumist device.
     private func stopDriver() {
         guard let engine = driver else { return }
+        stopReclaiming()
+        switchPending = false
+        nowPlayingClaim.end()
         stoppingDriver = true
         driverTimer?.invalidate()
         driverTimer = nil
@@ -704,6 +800,7 @@ final class MixerModel: ObservableObject {
         usingDriver = false
         UserDefaults.standard.set(false, forKey: Self.engineActiveKey)
         stoppingDriver = false
+        refreshDevices()
         defaultDeviceChanged(.output)
     }
 
@@ -765,6 +862,7 @@ final class MixerModel: ObservableObject {
         awaitingAudioRestart = false
         driverFailed = false
         log.info("Core Audio restarted; rebuilding")
+        stopReclaiming()
         if let driver {
             // Not stopDriver(): the old devices are gone, and keeping the "engine active" flag
             // makes the restart go back to the saved real output.
@@ -814,16 +912,38 @@ final class MixerModel: ObservableObject {
         if !driver.setOutput(device.id) {
             log.error("Couldn't play to \(device.name, privacy: .public)")
         }
+        log.info("Playing to \(device.name, privacy: .public)")
+        if device.id != output.selectedID { lastRouteChange = Date() }
         UserDefaults.standard.set(device.uid, forKey: Self.realOutputKey)
+        var history = UserDefaults.standard.stringArray(forKey: Self.outputHistoryKey) ?? []
+        history.removeAll { $0 == device.uid }
+        history.insert(device.uid, at: 0)
+        UserDefaults.standard.set(Array(history.prefix(10)), forKey: Self.outputHistoryKey)
         output.selectedID = device.id
         watchOutputVolume(device.id)
         refreshVolume(.output)
     }
 
+    #if DEBUG
+    private var lastLoggedGlitches: (UInt64, UInt64) = (0, 0)
+    #endif
+
     private func driverTick() {
         guard let driver else { return }
+        trackBluetoothLink()
+        if takeover == nil, !switchPending { nowPlayingClaim.end() }
+        updateReclaiming()
+        #if DEBUG
+        // Logs underruns and resyncs as they happen, for listening tests.
+        let stats = driver.stats
+        if (stats.underruns, stats.resyncs) != lastLoggedGlitches {
+            lastLoggedGlitches = (stats.underruns, stats.resyncs)
+            log.info("Engine: underruns=\(stats.underruns) resyncs=\(stats.resyncs) lag=\(Int(stats.lagFrames)) target=\(stats.targetFrames) ratio=\(stats.ratio)")
+        }
+        #endif
         // Make the Volumist device the default output once the driver has published it.
-        if driver.isDeviceVisible, let volumist = DriverEngine.deviceID, AudioDevices.defaultDeviceID(.output) != volumist {
+        if driver.isDeviceVisible, Date() >= holdDefaultUntil, let volumist = DriverEngine.deviceID,
+           AudioDevices.defaultDeviceID(.output) != volumist {
             AudioDevices.setDefaultOutput(volumist)
         }
         // The Volumist device's own volume changed (volume keys, Sound menu): apply it to the
@@ -838,6 +958,131 @@ final class MixerModel: ObservableObject {
         AudioDevices.setVolume(output.selectedID, .output, volume)
         AudioDevices.setMuted(output.selectedID, .output, muted)
         refreshVolume(.output)
+    }
+
+    /// Plays the mix to `device`. AirPods playing for an iPhone or iPad are taken back the way
+    /// the Sound menu does it: by making them the system default until this Mac has them (just
+    /// playing to them isn't enough). driverTick makes Volumist the default again as soon as the
+    /// link is here. Hidden headphones can't be the default, but playing to them is enough.
+    private func switchToOutput(_ device: AudioDevice) {
+        guard AudioDevices.hasBluetoothAudioLink(device.id) == false else {
+            useRealOutput(device)
+            return
+        }
+        if device.isActive {
+            let deadline = Date().addingTimeInterval(Self.takeoverTimeout)
+            takeover = (device.id, deadline)
+            holdDefaultUntil = deadline
+            AudioDevices.setDefault(device)
+            useRealOutput(device)
+            return
+        }
+        // Hidden headphones: only a request from a media app wins them back from an iPhone
+        // that's playing, so claim Now Playing first and give it a moment to register.
+        nowPlayingClaim.begin(title: device.name)
+        switchPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.claimLeadSeconds) { [weak self] in
+            guard let self, self.switchPending else { return }
+            self.switchPending = false
+            self.takeover = (device.id, Date().addingTimeInterval(Self.takeoverTimeout))
+            self.bounceDefault = (device.id, Date().addingTimeInterval(Self.takeoverTimeout + 2))
+            self.useRealOutput(device)
+        }
+    }
+
+    /// Ends a takeover once the Mac has the headphones, and falls back like macOS does when the
+    /// real output's headphones go to another device.
+    private func trackBluetoothLink() {
+        let id = output.selectedID
+        if let pending = takeover, pending.id != id || Date() >= pending.deadline { takeover = nil }
+        guard let linked = AudioDevices.hasBluetoothAudioLink(id) else {
+            unlinkedSince = nil
+            return
+        }
+        if takeover?.id == id, linked {
+            takeover = nil
+            holdDefaultUntil = min(holdDefaultUntil, Date().addingTimeInterval(0.3))
+        }
+        // The headphones came over by Smart Routing's automatic request. Without Volumist, apps'
+        // audio restarts on them at this point, and the Mac briefly tells the iPhone it's idle;
+        // that's what lets the iPhone take them back automatically when it plays again. Making
+        // them the system default for a moment restarts apps' audio the same way.
+        if let bounce = bounceDefault {
+            if bounce.id != id || Date() >= bounce.until {
+                bounceDefault = nil
+            } else if linked, takeover == nil, let device = AudioDevices.device(for: id, .output) {
+                bounceDefault = nil
+                holdDefaultUntil = Date().addingTimeInterval(Self.bounceSeconds)
+                AudioDevices.setDefault(device)
+            }
+        }
+        guard !linked, takeover == nil else {
+            unlinkedSince = nil
+            return
+        }
+        // A moment's grace: the link can trail the default output when macOS switches to them.
+        let since = unlinkedSince ?? Date()
+        unlinkedSince = since
+        if Date().timeIntervalSince(since) > 1, let fallback = fallbackOutput() {
+            let away = AudioDevices.device(for: id, .output, allowHidden: true)
+            log.info("\(away?.name ?? "Headphones", privacy: .public) is playing for another device")
+            unlinkedSince = nil
+            useRealOutput(fallback)
+        }
+    }
+
+    // MARK: - Taking headphones back
+
+    /// Headphones you're wearing that are with another device (or idle), most recently used first.
+    /// Like automatic switching, the Mac takes these when it starts playing.
+    private func reclaimableHeadphones() -> [AudioDevice] {
+        let history = UserDefaults.standard.stringArray(forKey: Self.outputHistoryKey) ?? []
+        return output.devices
+            .filter {
+                $0.id != output.selectedID && AudioDevices.isWorn($0.id) == true
+                    && AudioDevices.hasBluetoothAudioLink($0.id) == false
+            }
+            .sorted { (history.firstIndex(of: $0.uid) ?? .max) < (history.firstIndex(of: $1.uid) ?? .max) }
+    }
+
+    /// Starts or stops the fast check, depending on whether any headphones could be taken back.
+    private func updateReclaiming() {
+        let wanted = driver != nil && takeover == nil && !switchPending && !reclaimableHeadphones().isEmpty
+        if !wanted {
+            stopReclaiming()
+        } else if reclaimTimer == nil {
+            // Whatever is playing right now started before; it doesn't count.
+            let start = Date()
+            drainDriverPeaks()
+            for (key, last) in lastAudible where last >= start { audibleSince[key] = .distantPast }
+            reclaimTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.reclaimHeadphonesIfPlaying() }
+            }
+        }
+    }
+
+    private func stopReclaiming() {
+        reclaimTimer?.invalidate()
+        reclaimTimer = nil
+    }
+
+    /// Takes worn headphones back as soon as an app starts playing on the Mac, like automatic
+    /// switching does. Sound that was already going on before the mix last changed outputs
+    /// doesn't count, alert sounds never do, and apps with a switching delay in Settings must
+    /// play that long first (so a message ping doesn't take them).
+    private func reclaimHeadphonesIfPlaying() {
+        guard driver != nil, takeover == nil, !switchPending else { return }
+        drainDriverPeaks()
+        let now = Date()
+        let trigger = lastAudible.first { key, last in
+            guard now.timeIntervalSince(last) <= Self.soundGap, let since = audibleSince[key],
+                  since > lastRouteChange else { return false }
+            return now.timeIntervalSince(since) >= (switchDelays[key] ?? 0)
+        }
+        guard let trigger, let device = reclaimableHeadphones().first else { return }
+        log.info("\(trigger.key, privacy: .public) started playing; switching to \(device.name, privacy: .public)")
+        stopReclaiming()
+        switchToOutput(device)
     }
 
     /// Shows the real output's volume on the Volumist device (what the volume keys adjust).
