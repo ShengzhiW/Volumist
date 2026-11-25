@@ -119,6 +119,7 @@ struct GeneralSettingsView: View {
     @AppStorage(Preferences.appVolumeStep) private var appVolumeStep = 0.0
     @AppStorage(Preferences.showOutputSection) private var showOutputSection = true
     @AppStorage(Preferences.showInputSection) private var showInputSection = true
+    @AppStorage(Preferences.pauseTapsWhenSilent) private var pauseTapsWhenSilent = true
 
     var body: some View {
         Form {
@@ -129,6 +130,16 @@ struct GeneralSettingsView: View {
             Section("Menu") {
                 Toggle("Show Output section", isOn: $showOutputSection)
                 Toggle("Show Input section", isOn: $showInputSection)
+            }
+            Section {
+                Toggle("Stop capturing apps that aren't playing", isOn: $pauseTapsWhenSilent)
+                    .onChange(of: pauseTapsWhenSilent) { model.tapPausingChanged() }
+            } header: {
+                Text("Audio Capture")
+            } footer: {
+                Text("Volumist stops capturing an app a few seconds after it goes quiet, so the recording indicator goes away, and starting playback on the Mac takes your AirPods back from an iPhone like it does without Volumist. When the app plays again, its first moment may play at its normal volume before yours applies. Turn off to keep capturing all the time.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Section {
                 Toggle("Open at Login", isOn: Binding(

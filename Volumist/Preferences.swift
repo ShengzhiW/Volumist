@@ -9,6 +9,9 @@ enum Preferences {
     static let showInputSection = "showInputSection"
     static let outputExpanded = "outputDevicesExpanded"
     static let inputExpanded = "inputDevicesExpanded"
+    /// Stop, then remove, per-app volume taps while their app is silent: no recording indicator,
+    /// and macOS can switch AirPods from an iPhone when the Mac starts playing. On by default.
+    static let pauseTapsWhenSilent = "airPodsFromiPhone"
 
     /// Slider snapping choices: 0 means continuous.
     static let volumeSteps: [(value: Double, label: String)] = [

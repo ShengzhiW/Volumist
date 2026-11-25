@@ -467,9 +467,30 @@ final class MixerModel: ObservableObject {
         let setting = settings[entry.id] ?? AppSetting()
         let processIDs = entry.processObjectIDs.sorted()
 
+        // A silent app needs no tap. macOS shows the recording indicator for as long as a tap
+        // exists, so after a few quiet seconds (gaps between tracks don't count) it's removed,
+        // and made again when the app plays. Until then the IOProc is stopped (see AppTap).
+        if pauseTapsWhenSilent, !entry.isPlaying {
+            guard let tap = taps[entry.id] else { return }
+            tap.setRunning(false)
+            let since = silentSince[entry.id] ?? Date()
+            silentSince[entry.id] = since
+            let remaining = Self.tapIdleSeconds - Date().timeIntervalSince(since)
+            if remaining <= 0 {
+                taps.removeValue(forKey: entry.id)?.invalidate()
+                silentSince[entry.id] = nil
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + remaining + 0.05) { [weak self] in
+                    self?.syncTaps()
+                }
+            }
+            return
+        }
+        silentSince[entry.id] = nil
+
         if let tap = taps[entry.id], tap.processObjectIDs == processIDs {
             tap.setGain(setting.gain)
-            tap.setRunning(entry.isPlaying)
+            tap.setRunning(true)
             guard tap.outputDeviceID != output.selectedID else { return }
             // An output picked in the menu: move the tap rather than rebuild it, so its audio
             // doesn't restart and pull AirPods back (see moveOutput). Other output changes
@@ -490,13 +511,26 @@ final class MixerModel: ObservableObject {
         do {
             // Build the replacement before tearing down the old one so the app never blips to full volume.
             let tap = try AppTap(processObjectIDs: processIDs, outputDevice: device, gain: setting.gain,
-                                 running: entry.isPlaying)
+                                 running: true)
             taps[entry.id]?.invalidate()
             taps[entry.id] = tap
         } catch {
             log.error("Couldn't tap \(entry.name, privacy: .public): \(String(describing: error), privacy: .public)")
             permission = AudioCapturePermission.current
         }
+    }
+
+    /// Whether taps of silent apps are stopped and then removed (Settings › General). Off keeps
+    /// every tap running all the time.
+    private var pauseTapsWhenSilent: Bool {
+        UserDefaults.standard.object(forKey: Preferences.pauseTapsWhenSilent) as? Bool ?? true
+    }
+    private var silentSince: [String: Date] = [:]
+    private static let tapIdleSeconds: TimeInterval = 5
+
+    /// The "pause while silent" setting changed.
+    func tapPausingChanged() {
+        syncTaps()
     }
 
     private var canTap: Bool {
