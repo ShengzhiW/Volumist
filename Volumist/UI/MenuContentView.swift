@@ -235,27 +235,38 @@ private struct DeviceSection: View {
 
     var body: some View {
         let devices = model.menuDevices(state.direction)
+        let selected = devices.first { $0.id == state.selectedID }
         let others = devices.filter { $0.id != state.selectedID }
-        let showAll = isExpanded || state.selected == nil
+        let showAll = isExpanded || selected == nil
 
-        DisclosureHeader(title: title, isExpanded: showAll, isEnabled: !others.isEmpty && state.selected != nil) {
-            withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() }
+        DisclosureHeader(title: title, isExpanded: showAll, isEnabled: !others.isEmpty && selected != nil) {
+            withAnimation(.easeInOut(duration: 0.22)) { isExpanded.toggle() }
         }
-        ForEach(showAll ? devices : state.selected.map { [$0] } ?? []) { device in
-            let controls = model.headphones[device.uid]
-            let expanded = controls != nil && expandedHeadphones.contains(device.uid)
+        // The device in use always comes first; expanding reveals the others below it.
+        if let selected { deviceRow(selected) }
+        Collapsible(isExpanded: showAll) {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(others) { deviceRow($0) }
+            }
+        }
+    }
+
+    private func deviceRow(_ device: AudioDevice) -> some View {
+        let controls = model.headphones[device.uid]
+        let expanded = controls != nil && expandedHeadphones.contains(device.uid)
+        return VStack(alignment: .leading, spacing: 0) {
             DeviceRow(device: device, isSelected: device.id == state.selectedID, battery: controls?.battery,
                       isExpanded: controls == nil ? nil : expanded) {
                 model.select(device)
             } toggleExpanded: {
-                withAnimation(.easeInOut(duration: 0.18)) {
+                withAnimation(.easeInOut(duration: 0.22)) {
                     if expanded { expandedHeadphones.remove(device.uid) } else { expandedHeadphones.insert(device.uid) }
                 }
             }
-            .transition(.opacity)
-            if expanded, let controls {
-                HeadphoneControls(device: device, state: controls)
-                    .transition(.opacity)
+            if let controls {
+                Collapsible(isExpanded: expanded) {
+                    HeadphoneControls(device: device, state: controls)
+                }
             }
         }
     }
