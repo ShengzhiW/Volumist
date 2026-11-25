@@ -18,7 +18,7 @@ struct MenuContentView: View {
                     .font(.system(size: 13, weight: .bold))
                 Spacer()
                 if model.output.volumeSettable {
-                    VolumeLabel(volume: model.output.volume, isMuted: model.output.muted)
+                    VolumeLabel(volume: model.output.volume, isMuted: model.output.isSilent)
                 }
             }
                 .padding(.horizontal, MenuMetrics.inset)
@@ -94,9 +94,10 @@ private struct OutputVolumeRow: View {
             MenuSlider(
                 value: Binding(get: { state.muted ? 0 : state.volume }, set: { model.setVolume($0, .output) }),
                 isEnabled: state.volumeSettable,
-                step: step
+                step: step,
+                onEditingChanged: { model.volumeDragChanged($0, for: nil) }
             )
-            MuteButton(isMuted: state.muted, label: "Output") {
+            MuteButton(isMuted: state.isSilent, label: "Output") {
                 model.toggleMute(.output)
             }
         }
@@ -146,7 +147,7 @@ private struct AppRow: View {
                     .resizable()
                     .interpolation(.high)
                     .frame(width: 28, height: 28)
-                    .opacity(app.isMuted ? 0.45 : 1)
+                    .opacity(app.isSilent ? 0.45 : 1)
                     .brightness(iconHovered ? -0.06 : 0)
                     .contentShape(Rectangle())
             }
@@ -179,16 +180,17 @@ private struct AppRow: View {
                     } else {
                         Spacer(minLength: 6)
                     }
-                    VolumeLabel(volume: app.volume, isMuted: app.isMuted)
+                    VolumeLabel(volume: app.volume, isMuted: app.isSilent)
                 }
                 HStack(spacing: 8) {
                     MenuSlider(
                         value: Binding(get: { app.isMuted ? 0 : app.volume }, set: { model.setVolume($0, for: app.id) }),
-                        isDimmed: app.isMuted,
+                        isDimmed: app.isSilent,
                         controlSize: .small,
-                        step: step
+                        step: step,
+                        onEditingChanged: { model.volumeDragChanged($0, for: app.id) }
                     )
-                    MuteButton(isMuted: app.isMuted, size: 20, label: app.name) {
+                    MuteButton(isMuted: app.isSilent, size: 20, label: app.name) {
                         model.toggleMute(for: app.id)
                     }
                 }

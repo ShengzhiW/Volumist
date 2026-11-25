@@ -9,9 +9,11 @@ struct MenuSlider: View {
     var controlSize: ControlSize = .regular
     /// Snap to multiples of this (e.g. 0.1 for 10%); 0 for continuous.
     var step: Double = 0
+    /// Called with true when a drag (or click) starts and false when it ends.
+    var onEditingChanged: (Bool) -> Void = { _ in }
 
     var body: some View {
-        Slider(value: Binding(get: { value }, set: { value = snapped($0) }), in: 0...1)
+        Slider(value: Binding(get: { value }, set: { value = snapped($0) }), in: 0...1, onEditingChanged: onEditingChanged)
             .labelsHidden()
             .controlSize(controlSize)
             .tint(isDimmed ? Color.secondary : Color.accentColor)

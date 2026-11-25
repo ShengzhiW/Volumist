@@ -21,6 +21,8 @@ struct AppAudio: Identifiable {
     var nowPlaying: String?
     var volume: Double
     var isMuted: Bool
+    /// Muted, or turned all the way down: shown as muted either way.
+    var isSilent: Bool { isMuted || volume < MixerModel.silentVolume }
 }
 
 /// An app for the Settings › Apps list: anything with an audio client, plus apps that are
@@ -41,6 +43,8 @@ struct DeviceState {
     var volumeSettable = false
 
     var selected: AudioDevice? { devices.first { $0.id == selectedID } }
+    /// Muted, or turned all the way down: shown as muted either way.
+    var isSilent: Bool { muted || volume < MixerModel.silentVolume }
 }
 
 struct AppSetting: Codable, Equatable {
@@ -187,6 +191,27 @@ final class MixerModel: ObservableObject {
 
     // MARK: - Apps
 
+    /// Volumes below this count as zero (shown as muted).
+    nonisolated static let silentVolume = 0.005
+    /// Restored when unmuting something that was turned all the way down: the volume it had
+    /// before the slider was dragged to zero. Keyed by app ID, or `outputKey` for the output.
+    private var volumeBeforeZero: [String: Double] = [:]
+    private var volumeAtDragStart: [String: Double] = [:]
+    private static let outputKey = "\u{0}output"
+    private static let fallbackVolume = 0.5
+
+    /// A volume slider drag (or click) started or ended.
+    func volumeDragChanged(_ dragging: Bool, for appID: String?) {
+        let key = appID ?? Self.outputKey
+        let current = appID.map { settings[$0]?.volume ?? AppSetting().volume } ?? output.volume
+        if dragging {
+            volumeAtDragStart[key] = current
+        } else if let start = volumeAtDragStart.removeValue(forKey: key),
+                  current < Self.silentVolume, start >= Self.silentVolume {
+            volumeBeforeZero[key] = start
+        }
+    }
+
     func setVolume(_ volume: Double, for appID: String) {
         var setting = settings[appID] ?? AppSetting()
         setting.volume = min(max(volume, 0), 1)
@@ -207,8 +232,14 @@ final class MixerModel: ObservableObject {
 
     func toggleMute(for appID: String) {
         var setting = settings[appID] ?? AppSetting()
-        setting.muted.toggle()
-        if !setting.muted, setting.volume == 0 { setting.volume = 0.5 }
+        if setting.muted || setting.volume < Self.silentVolume {
+            setting.muted = false
+            if setting.volume < Self.silentVolume {
+                setting.volume = volumeBeforeZero.removeValue(forKey: appID) ?? Self.fallbackVolume
+            }
+        } else {
+            setting.muted = true
+        }
         update(setting, for: appID)
     }
 
@@ -502,6 +533,11 @@ final class MixerModel: ObservableObject {
 
     func toggleMute(_ direction: AudioDirection) {
         let current = state(direction)
+        if direction == .output, !current.muted, current.volume < Self.silentVolume {
+            // Turned all the way down rather than muted: bring the volume back.
+            setVolume(volumeBeforeZero.removeValue(forKey: Self.outputKey) ?? Self.fallbackVolume, .output)
+            return
+        }
         AudioDevices.setMuted(current.selectedID, direction, !current.muted)
         refreshVolume(direction)
     }
