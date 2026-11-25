@@ -10,7 +10,7 @@ import Synchronization
 /// If the IOProc ever stops, the tap stops muting and the app plays normally.
 final class AppTap {
     let processObjectIDs: [AudioObjectID]
-    let outputDeviceID: AudioObjectID
+    private(set) var outputDeviceID: AudioObjectID
 
     private var tapID: AudioObjectID = .unknown
     private var aggregateID: AudioObjectID = .unknown
@@ -20,8 +20,8 @@ final class AppTap {
     init(processObjectIDs: [AudioObjectID], outputDevice: AudioDevice, gain: Float) throws {
         self.processObjectIDs = processObjectIDs
         self.outputDeviceID = outputDevice.id
-        let stereo = AudioDevices.stereoChannels(outputDevice.id)
-        renderer = TapRenderer(gain: gain, left: stereo.left, right: stereo.right)
+        renderer = TapRenderer(gain: gain)
+        renderer.useOutput(outputDevice.id)
 
         do {
             try start(outputDevice: outputDevice)
@@ -58,12 +58,6 @@ final class AppTap {
         renderer.tapChannels = Int(max(format.mChannelsPerFrame, 1))
         renderer.tapInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
 
-        // Input streams the output device itself contributes to the aggregate (e.g. a USB
-        // headset's mic). The tap's stream(s) come after these.
-        renderer.deviceInputStreams = CA.getArray(
-            outputDevice.id, CA.address(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput), zero: AudioObjectID.unknown
-        ).count
-
         let aggregateDescription: [String: Any] = [
             kAudioAggregateDeviceNameKey: "Volumist Tap",
             kAudioAggregateDeviceUIDKey: AudioDevices.privateUIDPrefix + UUID().uuidString,
@@ -97,6 +91,20 @@ final class AppTap {
         try check(AudioDeviceStart(aggregate, procID), "AudioDeviceStart")
     }
 
+    /// Plays to `device` instead, without stopping. Rebuilding the tap would start Volumist's
+    /// audio afresh, and macOS's AirPods routing takes new audio while AirPods are in your ears
+    /// as a reason to switch to them, undoing the output change that caused the rebuild.
+    func moveOutput(to device: AudioDevice) throws {
+        guard device.id != outputDeviceID else { return }
+        let uid = device.uid as CFString
+        try check(CA.set(aggregateID, CA.address(kAudioAggregateDevicePropertyFullSubDeviceList), [uid] as CFArray),
+                  "set sub-devices")
+        CA.set(aggregateID, CA.address(kAudioAggregateDevicePropertyMainSubDevice), uid)
+        CA.set(aggregateID, CA.address(kAudioAggregateDevicePropertyClockDevice), uid)
+        renderer.useOutput(device.id)
+        outputDeviceID = device.id
+    }
+
     func invalidate() {
         if aggregateID != .unknown {
             if let ioProcID {
@@ -118,17 +126,27 @@ final class AppTap {
 private final class TapRenderer: @unchecked Sendable {
     let targetGain: Atomic<UInt32>
     private var currentGain: Float
-    let left: Int
-    let right: Int
+    // The output's stereo pair, and the input streams the output device itself contributes to
+    // the aggregate (e.g. a USB headset's mic; the tap's stream(s) come after these). Atomic
+    // because moving the tap to another output changes them while it runs.
+    private let leftChannel = Atomic<Int>(0)
+    private let rightChannel = Atomic<Int>(1)
+    private let deviceInputStreamCount = Atomic<Int>(0)
     var tapChannels = 2
     var tapInterleaved = true
-    var deviceInputStreams = 0
 
-    init(gain: Float, left: Int, right: Int) {
+    init(gain: Float) {
         targetGain = Atomic(gain.bitPattern)
         currentGain = gain
-        self.left = left
-        self.right = right
+    }
+
+    func useOutput(_ device: AudioObjectID) {
+        let stereo = AudioDevices.stereoChannels(device)
+        leftChannel.store(stereo.left, ordering: .relaxed)
+        rightChannel.store(stereo.right, ordering: .relaxed)
+        let inputs = CA.getArray(device, CA.address(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput),
+                                 zero: AudioObjectID.unknown).count
+        deviceInputStreamCount.store(inputs, ordering: .relaxed)
     }
 
 
@@ -138,6 +156,9 @@ private final class TapRenderer: @unchecked Sendable {
             if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
         }
 
+        let left = leftChannel.load(ordering: .relaxed)
+        let right = rightChannel.load(ordering: .relaxed)
+        let deviceInputStreams = deviceInputStreamCount.load(ordering: .relaxed)
         let inputs = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let tapBufferCount = tapInterleaved ? 1 : tapChannels
         guard inputs.count >= tapBufferCount, tapBufferCount > 0 else { return }

@@ -467,9 +467,18 @@ final class MixerModel: ObservableObject {
         let setting = settings[entry.id] ?? AppSetting()
         let processIDs = entry.processObjectIDs.sorted()
 
-        if let tap = taps[entry.id], tap.processObjectIDs == processIDs, tap.outputDeviceID == output.selectedID {
+        if let tap = taps[entry.id], tap.processObjectIDs == processIDs {
             tap.setGain(setting.gain)
-            return
+            guard tap.outputDeviceID != output.selectedID else { return }
+            // An output picked in the menu: move the tap rather than rebuild it, so its audio
+            // doesn't restart and pull AirPods back (see moveOutput). Other output changes
+            // rebuild it: macOS's AirPods switching between the Mac and an iPhone relies on
+            // seeing audio stop and start again.
+            if Date() < keepTapsRunningUntil,
+               let device = output.selected ?? AudioDevices.device(for: output.selectedID, .output),
+               (try? tap.moveOutput(to: device)) != nil {
+                return
+            }
         }
         // Nothing to do until the user changes something.
         if taps[entry.id] == nil, setting.isDefault { return }
@@ -517,7 +526,11 @@ final class MixerModel: ObservableObject {
 
     // MARK: - Devices
 
+    /// Until then, output changes move taps instead of rebuilding them (see ensureTap).
+    private var keepTapsRunningUntil = Date.distantPast
+
     func select(_ device: AudioDevice) {
+        if device.direction == .output { keepTapsRunningUntil = Date().addingTimeInterval(2) }
         AudioDevices.setDefault(device)
     }
 
