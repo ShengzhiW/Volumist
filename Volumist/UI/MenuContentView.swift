@@ -374,6 +374,20 @@ private struct ControlsHeader: View {
     }
 }
 
+/// A system symbol, including the private ones the system Sound menu uses for AirPods listening
+/// modes (person.open.fill and friends), which `Image(systemName:)` doesn't load.
+private struct MenuSymbol: View {
+    let name: String
+
+    var body: some View {
+        if NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil {
+            Image(systemName: name)
+        } else {
+            Image(_internalSystemName: name)
+        }
+    }
+}
+
 /// A choice with a checkmark on the left, like the system menu's AirPods options.
 private struct OptionRow: View {
     let title: String
@@ -388,8 +402,8 @@ private struct OptionRow: View {
                     .font(.system(size: 11, weight: .semibold))
                     .opacity(isChecked ? 1 : 0)
                     .frame(width: 14)
-                Image(systemName: symbol)
-                    .font(.system(size: 12))
+                MenuSymbol(name: symbol)
+                    .font(.system(size: 13))
                     .foregroundStyle(.secondary)
                     .frame(width: 20)
                 Text(title).font(.system(size: 13))

@@ -29,12 +29,14 @@ enum AirPodsControls {
             }
         }
 
+        /// The symbols the system Sound menu uses. All but Off are private system symbols
+        /// (see `MenuSymbol`).
         var symbol: String {
             switch self {
-            case .off: return "person"
-            case .noiseCancellation: return "person.crop.circle.fill"
-            case .transparency: return "person.wave.2"
-            case .adaptive: return "sparkles"
+            case .off: return "person.crop.circle"
+            case .noiseCancellation: return "person.closed.fill"
+            case .transparency: return "person.open.fill"
+            case .adaptive: return "person.and.sparkles.fill"
             }
         }
 
