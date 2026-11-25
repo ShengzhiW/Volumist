@@ -61,7 +61,7 @@ enum SelfTest {
         }
 
         do {
-            let tap = try AppTap(processObjectIDs: [target.objectID], outputDevice: blackHole, gain: 1)
+            let tap = try AppTap(processObjectIDs: [target.objectID], outputDevice: blackHole, gain: 1, running: true)
             for gain: Float in [1, 0.25, 0] {
                 tap.setGain(gain)
                 Thread.sleep(forTimeInterval: 0.4)

@@ -7,17 +7,21 @@ import Synchronization
 /// The tap captures the app's audio and mutes its normal output. A private
 /// aggregate device (tap as input, the real output device as output) runs an
 /// IOProc that copies the tapped audio to the speakers with our gain applied.
-/// If the IOProc ever stops, the tap stops muting and the app plays normally.
+///
+/// The IOProc only runs while the app is playing (see `setRunning`), like the app's own
+/// output would. macOS's AirPods switching watches for audio starting on an idle Mac; a tap
+/// that never stopped would hide that, and AirPods wouldn't come back from an iPhone.
 final class AppTap {
     let processObjectIDs: [AudioObjectID]
     private(set) var outputDeviceID: AudioObjectID
+    private(set) var isRunning = false
 
     private var tapID: AudioObjectID = .unknown
     private var aggregateID: AudioObjectID = .unknown
     private var ioProcID: AudioDeviceIOProcID?
     private let renderer: TapRenderer
 
-    init(processObjectIDs: [AudioObjectID], outputDevice: AudioDevice, gain: Float) throws {
+    init(processObjectIDs: [AudioObjectID], outputDevice: AudioDevice, gain: Float, running: Bool) throws {
         self.processObjectIDs = processObjectIDs
         self.outputDeviceID = outputDevice.id
         renderer = TapRenderer(gain: gain)
@@ -25,6 +29,7 @@ final class AppTap {
 
         do {
             try start(outputDevice: outputDevice)
+            setRunning(running)
         } catch {
             invalidate()
             throw error
@@ -43,7 +48,9 @@ final class AppTap {
         description.uuid = UUID()
         description.name = "Volumist"
         description.isPrivate = true
-        description.muteBehavior = .mutedWhenTapped
+        // Muted whether or not the IOProc is running: it starts a moment after the app does,
+        // and with .mutedWhenTapped that first moment would play at full volume.
+        description.muteBehavior = .muted
 
         var tap = AudioObjectID.unknown
         try check(AudioHardwareCreateProcessTap(description, &tap), "AudioHardwareCreateProcessTap")
@@ -87,8 +94,17 @@ final class AppTap {
             renderer.render(input: input, output: output)
         }, "AudioDeviceCreateIOProcIDWithBlock")
         ioProcID = procID
+    }
 
-        try check(AudioDeviceStart(aggregate, procID), "AudioDeviceStart")
+    /// Runs the IOProc while the app plays and stops it while it doesn't.
+    func setRunning(_ running: Bool) {
+        guard running != isRunning, aggregateID != .unknown, let ioProcID else { return }
+        if running {
+            isRunning = AudioDeviceStart(aggregateID, ioProcID) == noErr
+        } else {
+            AudioDeviceStop(aggregateID, ioProcID)
+            isRunning = false
+        }
     }
 
     /// Plays to `device` instead, without stopping. Rebuilding the tap would start Volumist's

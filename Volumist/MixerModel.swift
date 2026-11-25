@@ -469,6 +469,7 @@ final class MixerModel: ObservableObject {
 
         if let tap = taps[entry.id], tap.processObjectIDs == processIDs {
             tap.setGain(setting.gain)
+            tap.setRunning(entry.isPlaying)
             guard tap.outputDeviceID != output.selectedID else { return }
             // An output picked in the menu: move the tap rather than rebuild it, so its audio
             // doesn't restart and pull AirPods back (see moveOutput). Other output changes
@@ -488,7 +489,8 @@ final class MixerModel: ObservableObject {
 
         do {
             // Build the replacement before tearing down the old one so the app never blips to full volume.
-            let tap = try AppTap(processObjectIDs: processIDs, outputDevice: device, gain: setting.gain)
+            let tap = try AppTap(processObjectIDs: processIDs, outputDevice: device, gain: setting.gain,
+                                 running: entry.isPlaying)
             taps[entry.id]?.invalidate()
             taps[entry.id] = tap
         } catch {
