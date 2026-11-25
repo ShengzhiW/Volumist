@@ -89,10 +89,8 @@ private struct OutputVolumeRow: View {
 
     var body: some View {
         let state = model.output
+        // Laid out like the app rows: the slider, then the mute button.
         HStack(spacing: 8) {
-            Image(systemName: "speaker.fill")
-                .font(.system(size: 13))
-                .frame(width: 16)
             MenuSlider(
                 value: Binding(get: { state.muted ? 0 : state.volume }, set: { model.setVolume($0, .output) }),
                 isEnabled: state.volumeSettable,
