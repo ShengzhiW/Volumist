@@ -242,29 +242,161 @@ private struct DeviceSection: View {
             withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() }
         }
         ForEach(showAll ? devices : state.selected.map { [$0] } ?? []) { device in
-            DeviceRow(device: device, isSelected: device.id == state.selectedID) {
+            let controls = model.headphones[device.uid]
+            let expanded = controls != nil && expandedHeadphones.contains(device.uid)
+            DeviceRow(device: device, isSelected: device.id == state.selectedID, battery: controls?.battery,
+                      isExpanded: controls == nil ? nil : expanded) {
                 model.select(device)
+            } toggleExpanded: {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    if expanded { expandedHeadphones.remove(device.uid) } else { expandedHeadphones.insert(device.uid) }
+                }
             }
             .transition(.opacity)
+            if expanded, let controls {
+                HeadphoneControls(device: device, state: controls)
+                    .transition(.opacity)
+            }
         }
     }
+
+    /// AirPods whose controls are showing. Starts collapsed each launch, like the system menu.
+    @State private var expandedHeadphones: Set<String> = []
 }
 
 private struct DeviceRow: View {
     let device: AudioDevice
     let isSelected: Bool
+    var battery: AirPodsControls.Battery?
+    /// nil when the device has no controls to show.
+    var isExpanded: Bool?
     let action: () -> Void
+    var toggleExpanded: () -> Void = {}
 
     var body: some View {
         MenuRow(action: action) {
             HStack(spacing: 10) {
                 CircleIcon(symbol: device.symbolName, tint: .accentColor, filled: isSelected)
-                Text(device.name)
-                    .font(.system(size: 13))
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(device.name)
+                        .font(.system(size: 13))
+                        .lineLimit(1)
+                    if let battery { BatteryLine(battery: battery, deviceSymbol: device.symbolName) }
+                }
+                Spacer(minLength: 0)
+                // Room for the chevron drawn over the row.
+                if isExpanded != nil { Color.clear.frame(width: 22, height: 1) }
+            }
+        }
+        .overlay(alignment: .trailing) {
+            if let isExpanded {
+                Button(action: toggleExpanded) {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, MenuMetrics.inset - 6)
+                .help(isExpanded ? "Hide \(device.name) controls" : "Show \(device.name) controls")
+                .accessibilityLabel(isExpanded ? "Hide \(device.name) controls" : "Show \(device.name) controls")
             }
         }
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+/// "🎧 76%  ▭ 100%" under an AirPods name, like the system menu.
+private struct BatteryLine: View {
+    let battery: AirPodsControls.Battery
+    let deviceSymbol: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let left = battery.left, let right = battery.right, abs(left - right) > 5 {
+                level("airpod.left", left)
+                level("airpod.right", right)
+            } else if let buds = battery.left.flatMap({ left in battery.right.map { min(left, $0) } ?? left }) ?? battery.right {
+                level(deviceSymbol, buds)
+            }
+            if let single = battery.single { level("battery.100percent", single) }
+            if let chargingCase = battery.chargingCase {
+                level(deviceSymbol == "airpodspro" ? "airpodspro.chargingcase.wireless.fill" : "airpods.chargingcase.fill", chargingCase)
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+    }
+
+    private func level(_ symbol: String, _ percent: Int) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: symbol).font(.system(size: 10))
+            Text("\(percent)%").monospacedDigit()
+        }
+    }
+}
+
+/// Listening Mode for one pair of AirPods.
+private struct HeadphoneControls: View {
+    @EnvironmentObject private var model: MixerModel
+    let device: AudioDevice
+    let state: AirPodsControls.State
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if !state.offeredModes.isEmpty {
+                ControlsHeader("Listening Mode")
+                ForEach(state.offeredModes) { mode in
+                    OptionRow(title: mode.title, symbol: mode.symbol, isChecked: state.listeningMode == mode) {
+                        model.setListeningMode(mode, on: device)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 6)
+        .background(Color.primary.opacity(0.04))
+        .padding(.vertical, 3)
+    }
+}
+
+private struct ControlsHeader: View {
+    let title: String
+    init(_ title: String) { self.title = title }
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, MenuMetrics.inset)
+            .padding(.bottom, 2)
+    }
+}
+
+/// A choice with a checkmark on the left, like the system menu's AirPods options.
+private struct OptionRow: View {
+    let title: String
+    let symbol: String
+    let isChecked: Bool
+    let action: () -> Void
+
+    var body: some View {
+        MenuRow(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .opacity(isChecked ? 1 : 0)
+                    .frame(width: 14)
+                Image(systemName: symbol)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
+                Text(title).font(.system(size: 13))
+            }
+            .frame(height: 22)
+        }
+        .accessibilityAddTraits(isChecked ? .isSelected : [])
     }
 }
 

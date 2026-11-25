@@ -88,6 +88,11 @@ final class MixerModel: ObservableObject {
     private static let audibleThreshold: Float = 0.0003  // about -70 dB
     private static let audibleHold: TimeInterval = 1.0
 
+    /// Listening mode and battery of connected AirPods, by device UID. Read
+    /// while the menu is open.
+    @Published private(set) var headphones: [String: AirPodsControls.State] = [:]
+    private var headphoneTimer: Timer?
+
     private var systemListeners: [PropertyListener] = []
     private var processListeners: [AudioObjectID: PropertyListener] = [:]
     private var outputVolumeListeners: [PropertyListener] = []
@@ -139,6 +144,12 @@ final class MixerModel: ObservableObject {
         refreshVolume(.output)
         if !menuIsOpen { menuSession += 1 }
         menuIsOpen = true
+        refreshHeadphones()
+        if headphoneTimer == nil {
+            headphoneTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshHeadphones() }
+            }
+        }
         // The status check can't always tell "granted" from "never asked", and doesn't notice
         // a permission turned on later in System Settings. Asking settles both: it answers
         // instantly and silently once the user has decided, and only prompts the first time.
@@ -155,6 +166,23 @@ final class MixerModel: ObservableObject {
     func menuDidClose() {
         menuIsOpen = false
         stopLevelMonitoring()
+        headphoneTimer?.invalidate()
+        headphoneTimer = nil
+    }
+
+    // MARK: - AirPods
+
+    private func refreshHeadphones() {
+        var states: [String: AirPodsControls.State] = [:]
+        for device in output.devices {
+            if let state = AirPodsControls.state(of: device) { states[device.uid] = state }
+        }
+        if states != headphones { headphones = states }
+    }
+
+    func setListeningMode(_ mode: AirPodsControls.ListeningMode, on device: AudioDevice) {
+        AirPodsControls.setListeningMode(mode, on: device)
+        headphones[device.uid]?.listeningMode = mode
     }
 
     // MARK: - Apps
